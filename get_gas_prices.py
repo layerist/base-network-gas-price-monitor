@@ -1,4 +1,5 @@
 import time
+import logging
 from web3 import Web3
 
 # Infura or another provider URL for Base network
@@ -8,10 +9,16 @@ INFURA_URL = "https://mainnet.base.org/v1/infura/YOUR_PROJECT_ID"
 web3 = Web3(Web3.HTTPProvider(INFURA_URL))
 
 def get_gas_prices():
-    """Fetches and prints the current gas prices in gwei."""
+    """Fetches and logs the current gas prices in gwei."""
     try:
         gas_price = web3.eth.gas_price  # Get the current gas price
-        base_fee = web3.eth.get_block('pending')['baseFeePerGas']  # Get the base fee from the pending block
+        pending_block = web3.eth.get_block('pending')
+        
+        if 'baseFeePerGas' not in pending_block:
+            logging.warning("Pending block does not contain 'baseFeePerGas'.")
+            return
+        
+        base_fee = pending_block['baseFeePerGas']  # Base fee from the pending block
         priority_fee = gas_price - base_fee  # Priority fee (MaxFeePerGas - BaseFeePerGas)
 
         # Convert from wei to gwei for readability
@@ -19,20 +26,27 @@ def get_gas_prices():
         base_fee_gwei = web3.from_wei(base_fee, 'gwei')
         priority_fee_gwei = web3.from_wei(priority_fee, 'gwei')
 
-        print(f"Gas Price: {gas_price_gwei} gwei | Base Fee: {base_fee_gwei} gwei | Priority Fee: {priority_fee_gwei} gwei")
+        logging.info(f"Gas Price: {gas_price_gwei} gwei | Base Fee: {base_fee_gwei} gwei | Priority Fee: {priority_fee_gwei} gwei")
 
     except Exception as e:
-        print(f"An error occurred: {e}")
+        logging.error(f"An error occurred while fetching gas prices: {e}")
 
-def main():
-    """Main loop to fetch gas prices every second."""
-    print("Starting gas price monitoring...")
+def main(interval=1):
+    """Main loop to fetch gas prices at the specified interval."""
+    logging.info("Starting gas price monitoring...")
+    
     try:
         while True:
             get_gas_prices()
-            time.sleep(1)
+            time.sleep(interval)
     except KeyboardInterrupt:
-        print("\nScript stopped by user.")
+        logging.info("Script stopped by user.")
+    except Exception as e:
+        logging.error(f"Unexpected error in main loop: {e}")
 
 if __name__ == "__main__":
-    main()
+    # Configure logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+    # Run the main function with the desired interval (in seconds)
+    main(interval=1)
