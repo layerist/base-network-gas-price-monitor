@@ -11,15 +11,17 @@ web3 = Web3(Web3.HTTPProvider(INFURA_URL))
 def get_gas_prices():
     """Fetches and logs the current gas prices in gwei."""
     try:
-        gas_price = web3.eth.gas_price  # Get the current gas price
-        pending_block = web3.eth.get_block('pending')
-        
+        gas_price = web3.eth.gas_price  # Get the current gas price in wei
+        pending_block = web3.eth.get_block('pending')  # Fetch the pending block
+
         if 'baseFeePerGas' not in pending_block:
-            logging.warning("Pending block does not contain 'baseFeePerGas'.")
+            logging.warning("Pending block does not contain 'baseFeePerGas'. Using only gas price.")
+            gas_price_gwei = web3.from_wei(gas_price, 'gwei')
+            logging.info(f"Gas Price: {gas_price_gwei} gwei (no base fee available)")
             return
-        
-        base_fee = pending_block['baseFeePerGas']  # Base fee from the pending block
-        priority_fee = gas_price - base_fee  # Priority fee (MaxFeePerGas - BaseFeePerGas)
+
+        base_fee = pending_block['baseFeePerGas']  # Base fee from the pending block in wei
+        priority_fee = gas_price - base_fee  # Priority fee (MaxFeePerGas - BaseFeePerGas) in wei
 
         # Convert from wei to gwei for readability
         gas_price_gwei = web3.from_wei(gas_price, 'gwei')
@@ -31,7 +33,7 @@ def get_gas_prices():
     except Exception as e:
         logging.error(f"An error occurred while fetching gas prices: {e}")
 
-def main(interval=1):
+def main(interval=10):
     """Main loop to fetch gas prices at the specified interval."""
     logging.info("Starting gas price monitoring...")
     
@@ -43,10 +45,12 @@ def main(interval=1):
         logging.info("Script stopped by user.")
     except Exception as e:
         logging.error(f"Unexpected error in main loop: {e}")
+    finally:
+        logging.info("Gas price monitoring stopped.")
 
 if __name__ == "__main__":
     # Configure logging
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
     # Run the main function with the desired interval (in seconds)
-    main(interval=1)
+    main(interval=10)
