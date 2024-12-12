@@ -12,7 +12,6 @@ PROVIDER_URL = "https://mainnet.base.org/v1/infura/YOUR_PROJECT_ID"
 # Initialize Web3 with a configurable timeout
 web3 = Web3(Web3.HTTPProvider(PROVIDER_URL, request_kwargs={'timeout': 10}))
 
-
 def get_gas_prices(retries: int = 5, delay: int = 1) -> Optional[dict]:
     """
     Fetch current gas prices in gwei with retry and exponential backoff.
@@ -58,7 +57,6 @@ def get_gas_prices(retries: int = 5, delay: int = 1) -> Optional[dict]:
     logging.error("Failed to fetch gas prices after multiple attempts.")
     return None
 
-
 def main(interval: int = 10, retries: int = 5, delay: int = 1):
     """
     Main loop to fetch and log gas prices at a specified interval.
@@ -84,7 +82,6 @@ def main(interval: int = 10, retries: int = 5, delay: int = 1):
         logging.error(f"Unexpected error in main loop: {e}")
     finally:
         logging.info("Gas price monitoring stopped.")
-
 
 if __name__ == "__main__":
     # Configure detailed logging to both stdout and a file
