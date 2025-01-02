@@ -6,13 +6,13 @@ import requests
 import sys
 from typing import Optional
 
-# Base network provider URL (replace with your provider key)
+# Configure provider URL (replace with your actual provider URL/key)
 PROVIDER_URL = "https://mainnet.base.org/v1/infura/YOUR_PROJECT_ID"
 
-# Initialize Web3 with a configurable timeout
+# Initialize Web3 with a timeout
 web3 = Web3(Web3.HTTPProvider(PROVIDER_URL, request_kwargs={'timeout': 10}))
 
-def get_gas_prices(retries: int = 5, delay: int = 1) -> Optional[dict]:
+def fetch_gas_prices(retries: int = 5, delay: int = 1) -> Optional[dict]:
     """
     Fetch current gas prices in gwei with retry and exponential backoff.
 
@@ -28,8 +28,9 @@ def get_gas_prices(retries: int = 5, delay: int = 1) -> Optional[dict]:
             gas_price = web3.eth.gas_price
             pending_block = web3.eth.get_block('pending')
 
+            # Check for 'baseFeePerGas' in the pending block
             if 'baseFeePerGas' not in pending_block:
-                logging.warning("Pending block lacks 'baseFeePerGas'. Using only gas price.")
+                logging.warning("Pending block lacks 'baseFeePerGas'. Returning only the gas price.")
                 return {"gas_price": web3.from_wei(gas_price, 'gwei')}
 
             base_fee = pending_block['baseFeePerGas']
@@ -57,9 +58,9 @@ def get_gas_prices(retries: int = 5, delay: int = 1) -> Optional[dict]:
     logging.error("Failed to fetch gas prices after multiple attempts.")
     return None
 
-def main(interval: int = 10, retries: int = 5, delay: int = 1):
+def monitor_gas_prices(interval: int = 10, retries: int = 5, delay: int = 1):
     """
-    Main loop to fetch and log gas prices at a specified interval.
+    Continuously fetch and log gas prices at a specified interval.
 
     Args:
         interval (int): Time interval (in seconds) between gas price fetches.
@@ -70,21 +71,21 @@ def main(interval: int = 10, retries: int = 5, delay: int = 1):
 
     try:
         while True:
-            gas_prices = get_gas_prices(retries, delay)
+            gas_prices = fetch_gas_prices(retries, delay)
             if gas_prices:
-                logging.info("Fetched gas prices successfully.")
+                logging.info("Gas prices fetched successfully: %s", gas_prices)
             else:
-                logging.warning("Failed to fetch gas prices this cycle.")
+                logging.warning("Failed to fetch gas prices in this cycle.")
             time.sleep(interval)
     except KeyboardInterrupt:
-        logging.info("Script stopped by user.")
+        logging.info("Monitoring interrupted by the user.")
     except Exception as e:
-        logging.error(f"Unexpected error in main loop: {e}")
+        logging.error(f"Unexpected error during monitoring: {e}")
     finally:
         logging.info("Gas price monitoring stopped.")
 
 if __name__ == "__main__":
-    # Configure detailed logging to both stdout and a file
+    # Set up logging to stdout and file with detailed format
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
@@ -94,5 +95,5 @@ if __name__ == "__main__":
         ],
     )
 
-    # Run the script
-    main(interval=10)
+    # Start the monitoring script
+    monitor_gas_prices(interval=10)
