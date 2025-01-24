@@ -4,31 +4,35 @@ from web3 import Web3
 from web3.exceptions import TimeExhausted
 import requests
 import sys
-from typing import Optional
+from typing import Optional, Dict
 
-# Configure provider URL (replace with your actual provider URL/key)
+# Configuration
 PROVIDER_URL = "https://mainnet.base.org/v1/infura/YOUR_PROJECT_ID"
+LOG_FILE = "gas_price_monitor.log"
+RETRY_LIMIT = 5
+RETRY_DELAY = 1
 
 # Initialize Web3 with a timeout
 web3 = Web3(Web3.HTTPProvider(PROVIDER_URL, request_kwargs={'timeout': 10}))
 
-def fetch_gas_prices(retries: int = 5, delay: int = 1) -> Optional[dict]:
+
+def fetch_gas_prices(retries: int = RETRY_LIMIT, delay: int = RETRY_DELAY) -> Optional[Dict[str, float]]:
     """
-    Fetch current gas prices in gwei with retry and exponential backoff.
+    Fetch current gas prices in gwei with retries and exponential backoff.
 
     Args:
-        retries (int): Number of retries for fetching data.
+        retries (int): Number of retry attempts.
         delay (int): Initial delay between retries (in seconds).
 
     Returns:
-        dict or None: Gas prices in gwei if successful, None otherwise.
+        dict or None: Dictionary containing gas prices (in gwei), or None on failure.
     """
     for attempt in range(retries):
         try:
             gas_price = web3.eth.gas_price
             pending_block = web3.eth.get_block('pending')
 
-            # Check for 'baseFeePerGas' in the pending block
+            # Validate presence of 'baseFeePerGas'
             if 'baseFeePerGas' not in pending_block:
                 logging.warning("Pending block lacks 'baseFeePerGas'. Returning only the gas price.")
                 return {"gas_price": web3.from_wei(gas_price, 'gwei')}
@@ -43,28 +47,29 @@ def fetch_gas_prices(retries: int = 5, delay: int = 1) -> Optional[dict]:
             }
 
             logging.info(
-                "Gas Price: %(gas_price).2f gwei | Base Fee: %(base_fee).2f gwei | Priority Fee: %(priority_fee).2f gwei",
-                gas_data
+                "Gas Price: %.2f gwei | Base Fee: %.2f gwei | Priority Fee: %.2f gwei",
+                gas_data["gas_price"], gas_data["base_fee"], gas_data["priority_fee"]
             )
             return gas_data
 
         except (requests.exceptions.Timeout, TimeExhausted) as e:
-            logging.warning(f"Connection issue: {e}. Retrying {attempt + 1}/{retries}...")
+            logging.warning(f"Timeout or connection issue: {e}. Retrying {attempt + 1}/{retries}...")
         except Exception as e:
             logging.error(f"Unexpected error: {e}. Retrying {attempt + 1}/{retries}...")
 
         time.sleep(delay * 2 ** attempt)  # Exponential backoff
 
-    logging.error("Failed to fetch gas prices after multiple attempts.")
+    logging.error("Failed to fetch gas prices after all retries.")
     return None
 
-def monitor_gas_prices(interval: int = 10, retries: int = 5, delay: int = 1):
+
+def monitor_gas_prices(interval: int = 10, retries: int = RETRY_LIMIT, delay: int = RETRY_DELAY):
     """
-    Continuously fetch and log gas prices at a specified interval.
+    Monitor and log gas prices at a specified interval.
 
     Args:
-        interval (int): Time interval (in seconds) between gas price fetches.
-        retries (int): Number of retries for fetching data on failure.
+        interval (int): Interval (in seconds) between gas price fetches.
+        retries (int): Number of retry attempts.
         delay (int): Initial delay between retries (exponential backoff applied).
     """
     logging.info("Starting gas price monitoring...")
@@ -73,27 +78,28 @@ def monitor_gas_prices(interval: int = 10, retries: int = 5, delay: int = 1):
         while True:
             gas_prices = fetch_gas_prices(retries, delay)
             if gas_prices:
-                logging.info("Gas prices fetched successfully: %s", gas_prices)
+                logging.info("Fetched gas prices: %s", gas_prices)
             else:
                 logging.warning("Failed to fetch gas prices in this cycle.")
             time.sleep(interval)
     except KeyboardInterrupt:
-        logging.info("Monitoring interrupted by the user.")
+        logging.info("Monitoring stopped by user.")
     except Exception as e:
         logging.error(f"Unexpected error during monitoring: {e}")
     finally:
-        logging.info("Gas price monitoring stopped.")
+        logging.info("Gas price monitoring has been terminated.")
+
 
 if __name__ == "__main__":
-    # Set up logging to stdout and file with detailed format
+    # Configure logging
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler("gas_price_monitor.log"),
+            logging.FileHandler(LOG_FILE),
         ],
     )
 
-    # Start the monitoring script
+    # Start monitoring gas prices
     monitor_gas_prices(interval=10)
