@@ -12,8 +12,9 @@ PROVIDER_URL = os.getenv("PROVIDER_URL", "https://mainnet.base.org/v1/infura/YOU
 LOG_FILE = "gas_price_monitor.log"
 RETRY_LIMIT = 5
 RETRY_DELAY = 1
+MONITOR_INTERVAL = 10  # Interval between gas price fetches (seconds)
 
-# Initialize Web3 with a timeout
+# Initialize Web3
 web3 = Web3(Web3.HTTPProvider(PROVIDER_URL, request_kwargs={'timeout': 10}))
 
 # Configure logging
@@ -42,50 +43,43 @@ def fetch_gas_prices(retries: int = RETRY_LIMIT, delay: int = RETRY_DELAY) -> Op
             gas_price = web3.eth.gas_price
             pending_block = web3.eth.get_block('pending')
 
-            if 'baseFeePerGas' not in pending_block:
-                logging.warning("Pending block lacks 'baseFeePerGas'. Returning only the gas price.")
-                return {"gas_price": web3.from_wei(gas_price, 'gwei')}
-
-            base_fee = pending_block['baseFeePerGas']
-            priority_fee = gas_price - base_fee
+            base_fee = pending_block.get('baseFeePerGas')
+            priority_fee = gas_price - base_fee if base_fee else None
 
             gas_data = {
                 "gas_price": web3.from_wei(gas_price, 'gwei'),
-                "base_fee": web3.from_wei(base_fee, 'gwei'),
-                "priority_fee": web3.from_wei(priority_fee, 'gwei'),
+                "base_fee": web3.from_wei(base_fee, 'gwei') if base_fee else None,
+                "priority_fee": web3.from_wei(priority_fee, 'gwei') if priority_fee else None,
             }
 
-            logging.info("Gas Price: %.2f gwei | Base Fee: %.2f gwei | Priority Fee: %.2f gwei", 
-                         gas_data["gas_price"], gas_data["base_fee"], gas_data["priority_fee"])
+            logging.info("Gas Prices: %s", gas_data)
             return gas_data
 
         except (Timeout, TimeExhausted, ProviderConnectionError, RequestException) as e:
-            logging.warning(f"Network error: {e}. Retrying {attempt + 1}/{retries}...")
+            logging.warning("Network error: %s. Retrying %d/%d...", e, attempt + 1, retries)
         except Exception as e:
-            logging.error(f"Unexpected error: {e}. Retrying {attempt + 1}/{retries}...")
+            logging.error("Unexpected error: %s. Retrying %d/%d...", e, attempt + 1, retries)
 
         exponential_backoff(attempt, delay)
 
     logging.error("Failed to fetch gas prices after all retries.")
     return None
 
-def monitor_gas_prices(interval: int = 10):
+def monitor_gas_prices(interval: int = MONITOR_INTERVAL):
     """Monitors and logs gas prices at a specified interval."""
     logging.info("Starting gas price monitoring...")
-    while True:
-        try:
+    try:
+        while True:
             gas_prices = fetch_gas_prices()
-            if gas_prices:
-                logging.info("Fetched gas prices: %s", gas_prices)
-            else:
+            if not gas_prices:
                 logging.warning("Failed to fetch gas prices in this cycle.")
             time.sleep(interval)
-        except KeyboardInterrupt:
-            logging.info("Monitoring stopped by user.")
-            break
-        except Exception as e:
-            logging.error(f"Unexpected error during monitoring: {e}")
-    logging.info("Gas price monitoring has been terminated.")
+    except KeyboardInterrupt:
+        logging.info("Monitoring stopped by user.")
+    except Exception as e:
+        logging.error("Unexpected error during monitoring: %s", e)
+    finally:
+        logging.info("Gas price monitoring has been terminated.")
 
 def cleanup():
     """Executes cleanup actions before exiting."""
@@ -94,4 +88,4 @@ def cleanup():
 atexit.register(cleanup)
 
 if __name__ == "__main__":
-    monitor_gas_prices(interval=10)
+    monitor_gas_prices()
