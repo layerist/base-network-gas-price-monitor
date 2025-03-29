@@ -11,7 +11,7 @@ from typing import Optional, Dict
 PROVIDER_URL = os.getenv("PROVIDER_URL", "https://mainnet.base.org/v1/infura/YOUR_PROJECT_ID")
 LOG_FILE = "gas_price_monitor.log"
 RETRY_LIMIT = 5
-RETRY_DELAY = 1
+RETRY_DELAY = 1  # Initial retry delay in seconds
 MONITOR_INTERVAL = 10  # Interval between gas price fetches (seconds)
 
 # Initialize Web3
@@ -43,8 +43,8 @@ def fetch_gas_prices(retries: int = RETRY_LIMIT, delay: int = RETRY_DELAY) -> Op
             gas_price = web3.eth.gas_price
             pending_block = web3.eth.get_block('pending')
 
-            base_fee = pending_block.get('baseFeePerGas')
-            priority_fee = gas_price - base_fee if base_fee else None
+            base_fee = pending_block.get('baseFeePerGas', 0)
+            priority_fee = max(gas_price - base_fee, 0) if base_fee else None
 
             gas_data = {
                 "gas_price": web3.from_wei(gas_price, 'gwei'),
@@ -70,8 +70,7 @@ def monitor_gas_prices(interval: int = MONITOR_INTERVAL):
     logging.info("Starting gas price monitoring...")
     try:
         while True:
-            gas_prices = fetch_gas_prices()
-            if not gas_prices:
+            if not fetch_gas_prices():
                 logging.warning("Failed to fetch gas prices in this cycle.")
             time.sleep(interval)
     except KeyboardInterrupt:
