@@ -1,14 +1,16 @@
 import os
 import time
 import logging
-import atexit
-import signal
 import random
+import signal
+import atexit
 from typing import Optional, Dict, Any
 
+from logging.handlers import RotatingFileHandler
 from web3 import Web3
 from web3.exceptions import TimeExhausted, ProviderConnectionError
 from requests.exceptions import Timeout, RequestException
+
 
 # === Configuration ===
 class Config:
@@ -32,14 +34,20 @@ formatter = logging.Formatter(
     '%(asctime)s [%(levelname)s] %(name)s | %(message)s'
 )
 
-for output in (logging.StreamHandler(), logging.FileHandler(Config.LOG_FILE, mode="a")):
-    output.setFormatter(formatter)
-    logger.addHandler(output)
+# Rotate logs: max 5MB, keep 3 backups
+file_handler = RotatingFileHandler(Config.LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3)
+file_handler.setFormatter(formatter)
+
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(formatter)
+
+logger.addHandler(file_handler)
+logger.addHandler(stream_handler)
 
 
 # === Web3 Provider ===
 def get_web3(url: str) -> Web3:
-    """Initialize and return a Web3 instance with basic connectivity check."""
+    """Initialize and return a Web3 instance with connectivity check."""
     w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 10}))
     if not w3.is_connected():
         raise ConnectionError(f"Web3 provider not connected: {url}")
@@ -47,24 +55,28 @@ def get_web3(url: str) -> Web3:
 
 
 # === Utility Functions ===
-def exponential_backoff(attempt: int) -> None:
-    """Sleep with exponential backoff and jitter, capped by max delay and max total time."""
+def exponential_backoff(attempt: int, total_wait: float) -> float:
+    """
+    Sleep with exponential backoff and jitter, capped by max delay and total backoff.
+    Returns the new accumulated total wait time.
+    """
     delay = min(Config.RETRY_BASE_DELAY * (2 ** attempt), Config.MAX_RETRY_DELAY)
     jitter = random.uniform(0.8, 1.2)
-    wait_time = delay * jitter
-    if wait_time > Config.MAX_TOTAL_BACKOFF:
-        wait_time = Config.MAX_TOTAL_BACKOFF
-    logger.debug("Retrying after %.2f seconds...", wait_time)
-    time.sleep(wait_time)
+    wait_time = min(delay * jitter, Config.MAX_TOTAL_BACKOFF - total_wait)
+
+    if wait_time > 0:
+        logger.debug("Retrying after %.2f seconds...", wait_time)
+        time.sleep(wait_time)
+
+    return total_wait + wait_time
 
 
 def fetch_gas_prices(web3: Web3, retries: int = Config.RETRY_LIMIT) -> Optional[Dict[str, Any]]:
     """
-    Attempt to fetch gas price, base fee, and priority fee from the Ethereum network.
-
-    Returns:
-        Dictionary with 'gas_price', 'base_fee', and 'priority_fee' in Gwei, or None on failure.
+    Fetch gas price, base fee, and priority fee from the Ethereum network.
+    Returns dict with values in Gwei or None on failure.
     """
+    total_wait = 0.0
     for attempt in range(retries):
         try:
             gas_price_wei = web3.eth.gas_price
@@ -85,7 +97,6 @@ def fetch_gas_prices(web3: Web3, retries: int = Config.RETRY_LIMIT) -> Optional[
                 gas_data["base_fee"] or 0.0,
                 gas_data["priority_fee"] or 0.0,
             )
-
             return gas_data
 
         except (Timeout, TimeExhausted, ProviderConnectionError, RequestException) as net_err:
@@ -93,38 +104,19 @@ def fetch_gas_prices(web3: Web3, retries: int = Config.RETRY_LIMIT) -> Optional[
         except Exception as err:
             logger.exception("Unexpected error (attempt %d/%d): %s", attempt + 1, retries, err)
 
-        exponential_backoff(attempt)
+        total_wait = exponential_backoff(attempt, total_wait)
+        if total_wait >= Config.MAX_TOTAL_BACKOFF:
+            break
 
     logger.error("All %d attempts failed. Could not retrieve gas prices.", retries)
     return None
 
 
-def monitor_gas_prices(interval: int = Config.MONITOR_INTERVAL) -> None:
-    """Main monitoring loop that logs gas prices at regular intervals."""
-    logger.info("Starting gas price monitor (every %d seconds)...", interval)
-    web3 = get_web3(Config.PROVIDER_URL)
-
-    while True:
-        try:
-            if fetch_gas_prices(web3) is None:
-                logger.warning("Failed to retrieve gas prices this cycle.")
-        except Exception as e:
-            logger.exception("Unhandled error in monitoring loop: %s", e)
-            # Try reconnecting if provider is broken
-            try:
-                web3 = get_web3(Config.PROVIDER_URL)
-                logger.info("Reconnected to Web3 provider.")
-            except Exception:
-                logger.critical("Failed to reconnect to Web3 provider.")
-        time.sleep(interval)
-
-
-# === Cleanup and Signal Handling ===
+# === Monitoring ===
 class GracefulKiller:
     """Handles SIGINT/SIGTERM for graceful shutdown."""
-    kill_now: bool = False
-
     def __init__(self) -> None:
+        self.kill_now = False
         signal.signal(signal.SIGINT, self.exit_gracefully)
         signal.signal(signal.SIGTERM, self.exit_gracefully)
 
@@ -133,12 +125,37 @@ class GracefulKiller:
         self.kill_now = True
 
 
+def monitor_gas_prices(interval: int, killer: GracefulKiller) -> None:
+    """Monitoring loop that logs gas prices at regular intervals until stopped."""
+    logger.info("Starting gas price monitor (every %d seconds)...", interval)
+
+    web3 = None
+    while not killer.kill_now:
+        if web3 is None:
+            try:
+                web3 = get_web3(Config.PROVIDER_URL)
+                logger.info("Connected to Web3 provider.")
+            except Exception as e:
+                logger.critical("Failed to connect to Web3 provider: %s", e)
+                time.sleep(interval)
+                continue
+
+        try:
+            if fetch_gas_prices(web3) is None:
+                logger.warning("Failed to retrieve gas prices this cycle.")
+        except Exception as e:
+            logger.exception("Unhandled error in monitoring loop: %s", e)
+            web3 = None  # force reconnect on next cycle
+
+        time.sleep(interval)
+
+
+# === Entry Point ===
 def main() -> None:
     killer = GracefulKiller()
     logger.info("Gas price monitor started.")
     try:
-        while not killer.kill_now:
-            monitor_gas_prices()
+        monitor_gas_prices(Config.MONITOR_INTERVAL, killer)
     finally:
         logger.info("Gas price monitor stopped.")
 
@@ -146,6 +163,5 @@ def main() -> None:
 atexit.register(lambda: logger.info("Process exited."))
 
 
-# === Entry Point ===
 if __name__ == "__main__":
     main()
