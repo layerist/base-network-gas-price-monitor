@@ -13,10 +13,19 @@ from web3.exceptions import TimeExhausted, ProviderConnectionError
 from requests.exceptions import Timeout, RequestException
 
 
-# === Configuration ===
+# ============================================================
+#  CONFIGURATION
+# ============================================================
+
 class Config:
-    """Centralized configuration with environment overrides."""
-    PROVIDER_URL: str = os.getenv("PROVIDER_URL", "").strip() or "https://mainnet.base.org/v1/infura/YOUR_PROJECT_ID"
+    PROVIDER_URL: str = os.getenv("PROVIDER_URL", "").strip() or \
+                        "https://mainnet.base.org/v1/infura/YOUR_PROJECT_ID"
+
+    FALLBACK_PROVIDERS = [
+        "https://base.llamarpc.com",
+        "https://base-mainnet.public.blastapi.io",
+    ]
+
     LOG_FILE: str = os.getenv("LOG_FILE", "gas_price_monitor.log")
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -24,16 +33,41 @@ class Config:
     RETRY_BASE_DELAY: float = float(os.getenv("RETRY_BASE_DELAY", 1))
     MAX_RETRY_DELAY: float = float(os.getenv("MAX_RETRY_DELAY", 30))
     MAX_TOTAL_BACKOFF: float = float(os.getenv("MAX_TOTAL_BACKOFF", 120))
+
     MONITOR_INTERVAL: int = int(os.getenv("MONITOR_INTERVAL", 10))
     OUTPUT_JSON: bool = os.getenv("OUTPUT_JSON", "false").lower() == "true"
 
+    COLOR_LOGS: bool = True  # можно выключить
 
-# === Logging Setup ===
+
+# ============================================================
+#  LOGGING SETUP
+# ============================================================
+
+class ColorFormatter(logging.Formatter):
+    COLORS = {
+        "DEBUG": "\033[94m",
+        "INFO": "\033[92m",
+        "WARNING": "\033[93m",
+        "ERROR": "\033[91m",
+        "CRITICAL": "\033[91m",
+    }
+    RESET = "\033[0m"
+
+    def format(self, record):
+        msg = super().format(record)
+        if Config.COLOR_LOGS:
+            color = self.COLORS.get(record.levelname, "")
+            return f"{color}{msg}{self.RESET}"
+        return msg
+
+
 logger = logging.getLogger("GasPriceMonitor")
 logger.setLevel(getattr(logging, Config.LOG_LEVEL, logging.INFO))
-formatter = logging.Formatter(
-    "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+
+formatter = ColorFormatter(
+    "%(asctime)s | %(levelname)-8s | %(message)s",
+    "%Y-%m-%d %H:%M:%S"
 )
 
 file_handler = RotatingFileHandler(
@@ -49,129 +83,155 @@ if not logger.handlers:
     logger.addHandler(stream_handler)
 
 
-# === Web3 Provider ===
-def get_web3(url: str) -> Web3:
-    """Initialize and return a Web3 instance with connection verification."""
-    if not url or "YOUR_PROJECT_ID" in url:
-        logger.warning("Provider URL not configured properly. Using fallback public provider.")
-    w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 10}))
-    if not w3.is_connected():
-        raise ConnectionError(f"Unable to connect to Web3 provider: {url}")
-    logger.debug("Web3 connection established successfully.")
-    return w3
+# ============================================================
+#  WEB3 CLIENT
+# ============================================================
+
+class Web3Client:
+    """Web3 client with automatic reconnect and fallback providers."""
+
+    def __init__(self, primary_url: str, fallbacks: list[str]):
+        self.urls = [primary_url] + fallbacks
+        self.web3 = None
+        self._connect()
+
+    def _connect(self):
+        for url in self.urls:
+            try:
+                logger.info(f"Connecting to provider: {url}")
+                w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 10}))
+                if w3.is_connected():
+                    logger.info("Connected successfully.")
+                    self.web3 = w3
+                    return
+            except Exception as e:
+                logger.warning(f"Failed to connect to {url}: {e}")
+
+        raise ConnectionError("Unable to connect to ANY Web3 provider.")
+
+    def get_web3(self):
+        if self.web3 is None or not self.web3.is_connected():
+            logger.warning("Web3 disconnected. Reconnecting...")
+            self._connect()
+        return self.web3
 
 
-# === Utility Functions ===
+# ============================================================
+#  UTILITIES
+# ============================================================
+
+def log_json_or_text(data: Dict[str, Any]):
+    """Unified output function."""
+    if Config.OUTPUT_JSON:
+        print(json.dumps(data, ensure_ascii=False))
+    else:
+        logger.info(
+            "Gas [Gwei] total=%.2f | base=%.2f | priority=%.2f | block=%s",
+            data["gas_price_gwei"],
+            data["base_fee_gwei"] or 0.0,
+            data["priority_fee_gwei"] or 0.0,
+            data["block_number"],
+        )
+
+
 def exponential_backoff(attempt: int, total_wait: float) -> float:
-    """Apply exponential backoff with jitter, capped by total backoff."""
+    """Exponential backoff with jitter."""
     base = Config.RETRY_BASE_DELAY * (2 ** attempt)
     delay = min(base, Config.MAX_RETRY_DELAY)
-    jitter = random.uniform(0.8, 1.2)
-    wait_time = min(delay * jitter, Config.MAX_TOTAL_BACKOFF - total_wait)
+    wait = min(delay * random.uniform(0.8, 1.2),
+               Config.MAX_TOTAL_BACKOFF - total_wait)
 
-    if wait_time > 0:
-        logger.debug("Retry #%d in %.2fs...", attempt + 1, wait_time)
-        time.sleep(wait_time)
-    return total_wait + wait_time
+    if wait > 0:
+        logger.debug(f"Retry #{attempt + 1} in {wait:.2f}s")
+        time.sleep(wait)
+
+    return total_wait + wait
 
 
-def fetch_gas_prices(web3: Web3, retries: int = Config.RETRY_LIMIT) -> Optional[Dict[str, Any]]:
-    """Fetch gas prices and fees from Ethereum network. Returns values in Gwei or None on failure."""
+def fetch_gas_prices(client: Web3Client) -> Optional[Dict[str, Any]]:
+    """Fetch gas prices with retries."""
     total_wait = 0.0
 
-    for attempt in range(retries):
+    for attempt in range(Config.RETRY_LIMIT):
         try:
-            gas_price_wei = web3.eth.gas_price
-            block = web3.eth.get_block("pending")
+            w3 = client.get_web3()
 
-            base_fee_wei = block.get("baseFeePerGas", 0)
-            priority_fee_wei = gas_price_wei - base_fee_wei if base_fee_wei else None
+            gas_price_wei = w3.eth.gas_price
+            block = w3.eth.get_block("pending")
+
+            base_fee = block.get("baseFeePerGas") or 0
+            priority_fee = gas_price_wei - base_fee if base_fee else None
 
             result = {
-                "gas_price_gwei": float(web3.from_wei(gas_price_wei, "gwei")),
-                "base_fee_gwei": float(web3.from_wei(base_fee_wei, "gwei")) if base_fee_wei else None,
-                "priority_fee_gwei": float(web3.from_wei(priority_fee_wei, "gwei")) if priority_fee_wei else None,
+                "gas_price_gwei": float(w3.from_wei(gas_price_wei, "gwei")),
+                "base_fee_gwei": float(w3.from_wei(base_fee, "gwei")),
+                "priority_fee_gwei": float(w3.from_wei(priority_fee, "gwei")) if priority_fee else None,
                 "block_number": block.get("number"),
                 "timestamp": int(time.time()),
             }
 
-            if Config.OUTPUT_JSON:
-                print(json.dumps(result, ensure_ascii=False))
-            else:
-                logger.info(
-                    "Gas [Gwei] total=%.2f | base=%.2f | priority=%.2f | block=%s",
-                    result["gas_price_gwei"],
-                    result["base_fee_gwei"] or 0.0,
-                    result["priority_fee_gwei"] or 0.0,
-                    result["block_number"],
-                )
+            log_json_or_text(result)
             return result
 
         except (Timeout, TimeExhausted, ProviderConnectionError, RequestException) as net_err:
-            logger.warning("Network issue (attempt %d/%d): %s", attempt + 1, retries, net_err)
-        except Exception as err:
-            logger.exception("Unexpected error (attempt %d/%d): %s", attempt + 1, retries, err)
+            logger.warning(f"Network error (attempt {attempt + 1}): {net_err}")
+        except Exception as e:
+            logger.exception(f"Unexpected error: {e}")
 
         total_wait = exponential_backoff(attempt, total_wait)
         if total_wait >= Config.MAX_TOTAL_BACKOFF:
             break
 
-    logger.error("Failed to fetch gas prices after %d attempts.", retries)
+    logger.error("Failed to fetch gas price after retries.")
     return None
 
 
-# === Graceful Shutdown ===
-class GracefulKiller:
-    """Signal handler for clean shutdown."""
-    def __init__(self) -> None:
-        self.kill_now = False
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            signal.signal(sig, self._handler)
+# ============================================================
+#  GRACEFUL SHUTDOWN
+# ============================================================
 
-    def _handler(self, signum, frame) -> None:
-        logger.info("Received termination signal (%s). Shutting down gracefully...", signum)
+class GracefulKiller:
+    def __init__(self):
+        self.kill_now = False
+        signal.signal(signal.SIGINT, self._handler)
+        signal.signal(signal.SIGTERM, self._handler)
+
+    def _handler(self, *_):
+        logger.info("Received termination signal. Stopping...")
         self.kill_now = True
 
 
-# === Main Monitor ===
-def monitor_gas_prices(interval: int, killer: GracefulKiller) -> None:
-    """Main monitoring loop."""
-    logger.info("Gas price monitor started (interval=%ds)", interval)
-    web3 = None
+# ============================================================
+#  MAIN LOOP
+# ============================================================
+
+def monitor():
+    killer = GracefulKiller()
+    client = Web3Client(Config.PROVIDER_URL, Config.FALLBACK_PROVIDERS)
+
+    logger.info("Gas monitor started.")
 
     while not killer.kill_now:
         try:
-            if web3 is None:
-                web3 = get_web3(Config.PROVIDER_URL)
-                logger.info("Connected to provider: %s", Config.PROVIDER_URL)
-
-            if fetch_gas_prices(web3) is None:
-                logger.warning("No gas price data retrieved in this cycle.")
-
+            fetch_gas_prices(client)
         except Exception as e:
-            logger.exception("Error during monitoring cycle: %s", e)
-            web3 = None  # reconnect next iteration
+            logger.exception(f"Monitoring error: {e}")
 
-        # Sleep in short intervals to respond to shutdown quickly
-        for _ in range(interval * 10):
+        for _ in range(Config.MONITOR_INTERVAL * 10):
             if killer.kill_now:
                 break
             time.sleep(0.1)
 
-    logger.info("Gas price monitoring stopped.")
+    logger.info("Gas monitor stopped.")
 
 
-# === Entry Point ===
-def main() -> None:
-    killer = GracefulKiller()
-    atexit.register(lambda: logger.info("Process exited cleanly."))
+def main():
+    atexit.register(lambda: logger.info("Exit."))
 
     try:
-        monitor_gas_prices(Config.MONITOR_INTERVAL, killer)
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user.")
+        monitor()
     except Exception as e:
-        logger.exception("Fatal error: %s", e)
+        logger.exception(f"Fatal error: {e}")
 
 
 if __name__ == "__main__":
