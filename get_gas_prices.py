@@ -2,13 +2,12 @@
 """
 Robust gas price monitor for EVM networks (Base by default).
 
-Improvements:
-- Stronger typing and validation
-- Cleaner logging initialization (no duplicate handlers)
-- Better provider rotation and health checks
-- Safer fee calculation for EIP-1559 and legacy blocks
-- Centralized retry / backoff logic
-- Minor performance and readability improvements
+Features:
+- EIP-1559 aware fee calculation
+- Provider rotation with health checks
+- Centralized retry + exponential backoff
+- Clean logging with optional JSON output
+- Graceful shutdown handling
 """
 
 from __future__ import annotations
@@ -30,7 +29,7 @@ from requests.exceptions import Timeout, RequestException
 
 
 # ============================================================
-#  CONFIGURATION
+# CONFIGURATION
 # ============================================================
 
 @dataclass(frozen=True)
@@ -64,7 +63,7 @@ CFG = Config()
 
 
 # ============================================================
-#  LOGGING
+# LOGGING
 # ============================================================
 
 class ColorFormatter(logging.Formatter):
@@ -117,19 +116,22 @@ logger = setup_logger()
 
 
 # ============================================================
-#  WEB3 CLIENT
+# WEB3 CLIENT
 # ============================================================
 
 class Web3Client:
-    """Web3 client with automatic reconnect and provider rotation."""
+    """Web3 client with provider rotation and reconnect logic."""
 
     def __init__(self, primary_url: str, fallbacks: List[str]):
         self.urls = [primary_url, *fallbacks]
+        random.shuffle(self.urls)
         self._index = 0
         self.web3: Optional[Web3] = None
         self._connect()
 
     def _connect(self) -> None:
+        last_error: Optional[Exception] = None
+
         for _ in range(len(self.urls)):
             url = self.urls[self._index]
             self._index = (self._index + 1) % len(self.urls)
@@ -144,25 +146,30 @@ class Web3Client:
                 )
                 if w3.is_connected():
                     self.web3 = w3
-                    logger.info("Provider connected successfully.")
+                    logger.info("Provider connected.")
                     return
             except Exception as e:
-                logger.warning(f"Connection failed: {e}")
+                last_error = e
+                logger.warning(f"Provider failed: {e}")
 
-        raise ConnectionError("All Web3 providers are unavailable.")
+        raise ConnectionError("All Web3 providers unavailable") from last_error
 
     def get(self) -> Web3:
         if not self.web3 or not self.web3.is_connected():
-            logger.warning("Web3 disconnected, reconnecting...")
+            logger.warning("Web3 disconnected, rotating provider...")
             self._connect()
         return self.web3
 
+    def rotate(self) -> None:
+        self.web3 = None
+        self._connect()
+
 
 # ============================================================
-#  HELPERS
+# HELPERS
 # ============================================================
 
-def output(data: Dict[str, Any]) -> None:
+def emit(data: Dict[str, Any]) -> None:
     if CFG.OUTPUT_JSON:
         print(json.dumps(data, ensure_ascii=False))
     else:
@@ -175,37 +182,40 @@ def output(data: Dict[str, Any]) -> None:
         )
 
 
-def backoff(attempt: int, total_wait: float) -> float:
-    delay = min(
-        CFG.RETRY_BASE_DELAY * (2 ** attempt),
-        CFG.MAX_RETRY_DELAY,
-    )
-    jitter = random.uniform(0.8, 1.2)
-    wait = min(delay * jitter, CFG.MAX_TOTAL_BACKOFF - total_wait)
+def backoff(attempt: int, waited: float) -> float:
+    delay = min(CFG.RETRY_BASE_DELAY * (2 ** attempt), CFG.MAX_RETRY_DELAY)
+    delay *= random.uniform(0.8, 1.2)
 
-    if wait > 0:
-        logger.debug(f"Retry in {wait:.2f}s")
-        time.sleep(wait)
+    remaining = CFG.MAX_TOTAL_BACKOFF - waited
+    if remaining <= 0:
+        return waited
 
-    return total_wait + wait
+    sleep_time = min(delay, remaining)
+    logger.debug(f"Retrying in {sleep_time:.2f}s")
+    time.sleep(sleep_time)
+    return waited + sleep_time
 
 
 # ============================================================
-#  CORE LOGIC
+# CORE LOGIC
 # ============================================================
 
 def fetch_gas_prices(client: Web3Client) -> Optional[Dict[str, Any]]:
-    total_wait = 0.0
+    waited = 0.0
 
     for attempt in range(CFG.RETRY_LIMIT):
         try:
             w3 = client.get()
-
-            gas_price = w3.eth.gas_price
             block = w3.eth.get_block("pending")
 
+            gas_price = w3.eth.gas_price
             base_fee = block.get("baseFeePerGas") or 0
-            priority_fee = max(gas_price - base_fee, 0)
+
+            # EIP-1559 aware priority fee
+            try:
+                priority_fee = w3.eth.max_priority_fee
+            except Exception:
+                priority_fee = max(gas_price - base_fee, 0)
 
             result = {
                 "gas_price_gwei": float(w3.from_wei(gas_price, "gwei")),
@@ -215,16 +225,19 @@ def fetch_gas_prices(client: Web3Client) -> Optional[Dict[str, Any]]:
                 "timestamp": int(time.time()),
             }
 
-            output(result)
+            emit(result)
             return result
 
         except (Timeout, TimeExhausted, ProviderConnectionError, RequestException) as e:
             logger.warning(f"Network error (attempt {attempt + 1}): {e}")
+            client.rotate()
+
         except Exception:
             logger.exception("Unexpected error")
+            client.rotate()
 
-        total_wait = backoff(attempt, total_wait)
-        if total_wait >= CFG.MAX_TOTAL_BACKOFF:
+        waited = backoff(attempt, waited)
+        if waited >= CFG.MAX_TOTAL_BACKOFF:
             break
 
     logger.error("Gas price fetch failed after retries.")
@@ -232,7 +245,7 @@ def fetch_gas_prices(client: Web3Client) -> Optional[Dict[str, Any]]:
 
 
 # ============================================================
-#  GRACEFUL SHUTDOWN
+# GRACEFUL SHUTDOWN
 # ============================================================
 
 class GracefulShutdown:
@@ -247,7 +260,7 @@ class GracefulShutdown:
 
 
 # ============================================================
-#  MAIN LOOP
+# MAIN LOOP
 # ============================================================
 
 def monitor() -> None:
@@ -258,6 +271,7 @@ def monitor() -> None:
 
     while not shutdown.stop:
         fetch_gas_prices(client)
+
         for _ in range(CFG.MONITOR_INTERVAL * 10):
             if shutdown.stop:
                 break
