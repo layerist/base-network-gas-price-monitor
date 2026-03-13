@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Production-grade EVM Gas Price Monitor (Base by default)
+Production-grade EVM Gas Price Monitor
 
-Enhancements:
-- Provider health scoring + circuit breaker
+Key improvements:
+- HTTP connection pooling
+- Weighted provider selection
+- Provider health decay / recovery
+- Retry with provider reset
 - Strict EIP-1559 fee derivation
-- Unified exponential backoff with jitter
-- Deterministic shutdown (Event-based)
-- Structured logging (human or JSON)
-- Clean typing + separation of concerns
+- Deterministic shutdown
 """
 
 from __future__ import annotations
@@ -20,11 +20,12 @@ import random
 import signal
 import logging
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Callable, Type
 from functools import wraps
 from logging.handlers import RotatingFileHandler
 
+import requests
 from web3 import Web3
 from web3.exceptions import ProviderConnectionError, TimeExhausted
 from requests.exceptions import Timeout, RequestException
@@ -36,6 +37,7 @@ from requests.exceptions import Timeout, RequestException
 
 @dataclass(frozen=True)
 class Config:
+
     PROVIDER_URL: str = os.getenv(
         "PROVIDER_URL",
         "https://mainnet.base.org/v1/infura/YOUR_PROJECT_ID",
@@ -48,18 +50,19 @@ class Config:
 
     LOG_FILE: str = os.getenv("LOG_FILE", "gas_monitor.log")
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
+
     OUTPUT_JSON: bool = os.getenv("OUTPUT_JSON", "false").lower() == "true"
-    COLOR_LOGS: bool = os.getenv("COLOR_LOGS", "true").lower() == "true"
 
     HTTP_TIMEOUT: int = int(os.getenv("HTTP_TIMEOUT", 10))
 
     RETRY_LIMIT: int = int(os.getenv("RETRY_LIMIT", 5))
-    RETRY_BASE_DELAY: float = float(os.getenv("RETRY_BASE_DELAY", 1.0))
-    RETRY_MAX_DELAY: float = float(os.getenv("RETRY_MAX_DELAY", 30.0))
+    RETRY_BASE_DELAY: float = float(os.getenv("RETRY_BASE_DELAY", 1))
+    RETRY_MAX_DELAY: float = float(os.getenv("RETRY_MAX_DELAY", 30))
 
     MONITOR_INTERVAL: int = int(os.getenv("MONITOR_INTERVAL", 10))
+
     PROVIDER_COOLDOWN: int = int(os.getenv("PROVIDER_COOLDOWN", 60))
-    MAX_PROVIDER_SCORE: int = 3
+    MAX_PROVIDER_SCORE: int = int(os.getenv("MAX_PROVIDER_SCORE", 3))
 
 
 CFG = Config()
@@ -70,35 +73,17 @@ CFG = Config()
 # ============================================================
 
 class JsonFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
-        return json.dumps(
-            {
-                "ts": self.formatTime(record, "%Y-%m-%d %H:%M:%S"),
-                "level": record.levelname,
-                "message": record.getMessage(),
-            },
-            ensure_ascii=False,
-        )
-
-
-class ColorFormatter(logging.Formatter):
-    COLORS = {
-        "DEBUG": "\033[94m",
-        "INFO": "\033[92m",
-        "WARNING": "\033[93m",
-        "ERROR": "\033[91m",
-        "CRITICAL": "\033[95m",
-    }
-    RESET = "\033[0m"
 
     def format(self, record: logging.LogRecord) -> str:
-        msg = super().format(record)
-        if CFG.COLOR_LOGS and record.levelname in self.COLORS:
-            return f"{self.COLORS[record.levelname]}{msg}{self.RESET}"
-        return msg
+        return json.dumps({
+            "ts": self.formatTime(record),
+            "level": record.levelname,
+            "msg": record.getMessage()
+        })
 
 
 def setup_logger() -> logging.Logger:
+
     logger = logging.getLogger("GasMonitor")
     logger.setLevel(getattr(logging, CFG.LOG_LEVEL, logging.INFO))
     logger.propagate = False
@@ -106,25 +91,24 @@ def setup_logger() -> logging.Logger:
     if logger.handlers:
         return logger
 
-    formatter = (
-        JsonFormatter()
-        if CFG.OUTPUT_JSON
-        else ColorFormatter("%(asctime)s | %(levelname)-8s | %(message)s")
+    formatter = JsonFormatter() if CFG.OUTPUT_JSON else logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | %(message)s"
     )
 
     file_handler = RotatingFileHandler(
         CFG.LOG_FILE,
-        maxBytes=5 * 1024 * 1024,
+        maxBytes=5_000_000,
         backupCount=3,
-        encoding="utf-8",
+        encoding="utf-8"
     )
+
     file_handler.setFormatter(formatter)
 
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
+    console = logging.StreamHandler()
+    console.setFormatter(formatter)
 
+    logger.addHandler(console)
     logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
 
     return logger
 
@@ -145,14 +129,19 @@ RETRY_ERRORS: tuple[Type[Exception], ...] = (
 
 
 def retry(fn: Callable[..., Any]) -> Callable[..., Any]:
+
     @wraps(fn)
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
+    def wrapper(*args: Any, **kwargs: Any):
+
         delay = CFG.RETRY_BASE_DELAY
 
         for attempt in range(1, CFG.RETRY_LIMIT + 1):
+
             try:
                 return fn(*args, **kwargs)
+
             except RETRY_ERRORS as e:
+
                 if attempt >= CFG.RETRY_LIMIT:
                     raise
 
@@ -164,92 +153,135 @@ def retry(fn: Callable[..., Any]) -> Callable[..., Any]:
                     attempt,
                     CFG.RETRY_LIMIT,
                     sleep_time,
-                    str(e),
+                    e,
                 )
 
                 time.sleep(sleep_time)
+
                 delay *= 2
 
     return wrapper
 
 
 # ============================================================
-# PROVIDER HEALTH SYSTEM
+# PROVIDER HEALTH
 # ============================================================
 
 @dataclass
 class Provider:
+
     url: str
     score: int = 0
-    cooldown_until: float = 0.0
+    cooldown_until: float = 0
 
     def healthy(self) -> bool:
-        return self.score < CFG.MAX_PROVIDER_SCORE and time.time() >= self.cooldown_until
 
-    def penalize(self) -> None:
+        if time.time() < self.cooldown_until:
+            return False
+
+        return self.score < CFG.MAX_PROVIDER_SCORE
+
+    def penalize(self):
+
         self.score += 1
         self.cooldown_until = time.time() + CFG.PROVIDER_COOLDOWN
 
-    def recover(self) -> None:
-        self.score = max(0, self.score - 1)
+    def recover(self):
 
+        if self.score > 0:
+            self.score -= 1
+
+
+# ============================================================
+# WEB3 CLIENT
+# ============================================================
 
 class Web3Client:
+
     def __init__(self, primary: str, fallbacks: List[str]):
+
         self.providers = [Provider(primary), *[Provider(p) for p in fallbacks]]
+
         self.web3: Optional[Web3] = None
         self.current: Optional[Provider] = None
 
-    def _connect(self) -> None:
-        for provider in sorted(self.providers, key=lambda p: p.score):
-            if not provider.healthy():
-                continue
+        self.session = requests.Session()
 
-            try:
-                logger.info("Connecting to %s", provider.url)
-                w3 = Web3(
-                    Web3.HTTPProvider(
-                        provider.url,
-                        request_kwargs={"timeout": CFG.HTTP_TIMEOUT},
-                    )
-                )
-                if w3.is_connected():
-                    self.web3 = w3
-                    self.current = provider
-                    provider.recover()
-                    return
-            except Exception:
-                provider.penalize()
+    def _select_provider(self) -> Provider:
 
-        raise ConnectionError("No healthy providers available")
+        healthy = [p for p in self.providers if p.healthy()]
+
+        if not healthy:
+            raise ConnectionError("No healthy providers")
+
+        # weighted random (lower score = higher chance)
+        weights = [CFG.MAX_PROVIDER_SCORE - p.score for p in healthy]
+
+        return random.choices(healthy, weights=weights, k=1)[0]
+
+    def _connect(self):
+
+        provider = self._select_provider()
+
+        logger.info("Connecting to %s", provider.url)
+
+        w3 = Web3(
+            Web3.HTTPProvider(
+                provider.url,
+                request_kwargs={
+                    "timeout": CFG.HTTP_TIMEOUT,
+                    "session": self.session
+                }
+            )
+        )
+
+        if not w3.is_connected():
+
+            provider.penalize()
+            raise ConnectionError("Provider connection failed")
+
+        self.web3 = w3
+        self.current = provider
+
+        provider.recover()
 
     def get(self) -> Web3:
-        if not self.web3 or not self.web3.is_connected():
-            self._connect()
+
+        if self.web3 and self.web3.is_connected():
+            return self.web3
+
+        self._connect()
+
         return self.web3
 
-    def penalize_current(self) -> None:
+    def penalize_current(self):
+
         if self.current:
             self.current.penalize()
+
         self.web3 = None
         self.current = None
 
 
 # ============================================================
-# GAS FETCHING
+# GAS FETCH
 # ============================================================
 
 @retry
 def fetch_gas(client: Web3Client) -> Dict[str, Any]:
+
     w3 = client.get()
+
     block = w3.eth.get_block("pending")
 
     base_fee = block.get("baseFeePerGas", 0)
 
-    # Safe EIP-1559 derivation
     try:
+
         priority_fee = w3.eth.max_priority_fee
+
     except Exception:
+
         gas_price = w3.eth.gas_price
         priority_fee = max(gas_price - base_fee, 0)
 
@@ -260,7 +292,7 @@ def fetch_gas(client: Web3Client) -> Dict[str, Any]:
         "base_fee_gwei": float(w3.from_wei(base_fee, "gwei")),
         "priority_fee_gwei": float(w3.from_wei(priority_fee, "gwei")),
         "block": block.get("number"),
-        "timestamp": int(time.time()),
+        "timestamp": int(time.time())
     }
 
 
@@ -269,20 +301,26 @@ def fetch_gas(client: Web3Client) -> Dict[str, Any]:
 # ============================================================
 
 class GracefulShutdown:
-    def __init__(self) -> None:
+
+    def __init__(self):
+
         self.event = threading.Event()
+
         signal.signal(signal.SIGINT, self._handle)
         signal.signal(signal.SIGTERM, self._handle)
 
-    def _handle(self, *_: Any) -> None:
-        logger.info("Shutdown requested")
+    def _handle(self, *_):
+
+        logger.info("Shutdown signal received")
         self.event.set()
 
-    def wait(self, timeout: int) -> bool:
+    def wait(self, timeout: int):
+
         return self.event.wait(timeout)
 
     @property
-    def stopped(self) -> bool:
+    def stopped(self):
+
         return self.event.is_set()
 
 
@@ -290,31 +328,46 @@ class GracefulShutdown:
 # MAIN LOOP
 # ============================================================
 
-def emit(data: Dict[str, Any]) -> None:
+def emit(data: Dict[str, Any]):
+
     if CFG.OUTPUT_JSON:
-        print(json.dumps(data, ensure_ascii=False))
+
+        print(json.dumps(data))
+
     else:
+
         logger.info(
             "Gas %.2f gwei | base %.2f | tip %.2f | block %s",
             data["gas_price_gwei"],
             data["base_fee_gwei"],
             data["priority_fee_gwei"],
-            data["block"],
+            data["block"]
         )
 
 
-def monitor() -> None:
+def monitor():
+
     shutdown = GracefulShutdown()
-    client = Web3Client(CFG.PROVIDER_URL, list(CFG.FALLBACK_PROVIDERS))
+
+    client = Web3Client(
+        CFG.PROVIDER_URL,
+        list(CFG.FALLBACK_PROVIDERS)
+    )
 
     logger.info("Gas monitor started")
 
     while not shutdown.stopped:
+
         try:
+
             data = fetch_gas(client)
+
             emit(data)
+
         except Exception as e:
-            logger.error("Fetch failed: %s", str(e))
+
+            logger.error("Fetch failed: %s", e)
+
             client.penalize_current()
 
         shutdown.wait(CFG.MONITOR_INTERVAL)
@@ -322,9 +375,11 @@ def monitor() -> None:
     logger.info("Gas monitor stopped")
 
 
-def main() -> None:
+def main():
+
     monitor()
 
 
 if __name__ == "__main__":
+
     main()
