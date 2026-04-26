@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Ultra-robust EVM Gas Price Monitor
+Ultra-robust EVM Gas Price Monitor (v2)
 
-Improvements:
-- Thread-safe Web3 client
-- Adaptive provider scoring + decay
-- Circuit breaker per provider
-- Smarter retry (with provider rotation)
-- Better EIP-1559 compatibility
-- Connection pooling + cleanup
-- Extensible metrics hooks
+Major upgrades:
+- Parallel provider probing (fastest wins)
+- True circuit breaker (closed / open / half-open)
+- Latency-aware provider selection
+- Retry rotates providers immediately
+- Improved EIP-1559 fee estimation
+- Minimal locking (high concurrency safe)
+- Metrics hooks (plug Prometheus easily)
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List, Callable, Type
 from functools import wraps
 from logging.handlers import RotatingFileHandler
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from web3 import Web3
@@ -50,21 +51,21 @@ class Config:
 
     LOG_FILE: str = os.getenv("LOG_FILE", "gas_monitor.log")
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
-
     OUTPUT_JSON: bool = os.getenv("OUTPUT_JSON", "false").lower() == "true"
 
-    HTTP_TIMEOUT: int = int(os.getenv("HTTP_TIMEOUT", 10))
+    HTTP_TIMEOUT: int = int(os.getenv("HTTP_TIMEOUT", 8))
 
-    RETRY_LIMIT: int = int(os.getenv("RETRY_LIMIT", 5))
-    RETRY_BASE_DELAY: float = float(os.getenv("RETRY_BASE_DELAY", 1))
-    RETRY_MAX_DELAY: float = float(os.getenv("RETRY_MAX_DELAY", 30))
+    RETRY_LIMIT: int = int(os.getenv("RETRY_LIMIT", 4))
+    RETRY_BASE_DELAY: float = float(os.getenv("RETRY_BASE_DELAY", 0.5))
+    RETRY_MAX_DELAY: float = float(os.getenv("RETRY_MAX_DELAY", 10))
 
-    MONITOR_INTERVAL: int = int(os.getenv("MONITOR_INTERVAL", 10))
+    MONITOR_INTERVAL: int = int(os.getenv("MONITOR_INTERVAL", 8))
 
-    PROVIDER_COOLDOWN: int = int(os.getenv("PROVIDER_COOLDOWN", 60))
     MAX_PROVIDER_SCORE: int = int(os.getenv("MAX_PROVIDER_SCORE", 5))
+    COOLDOWN: int = int(os.getenv("COOLDOWN", 45))
+    HALF_OPEN_AFTER: int = int(os.getenv("HALF_OPEN_AFTER", 20))
 
-    SCORE_DECAY_TIME: int = int(os.getenv("SCORE_DECAY_TIME", 120))
+    PARALLEL_PROBES: int = int(os.getenv("PARALLEL_PROBES", 2))
 
 
 CFG = Config()
@@ -75,7 +76,7 @@ CFG = Config()
 # ============================================================
 
 class JsonFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
+    def format(self, record):
         return json.dumps({
             "ts": self.formatTime(record),
             "level": record.levelname,
@@ -83,7 +84,7 @@ class JsonFormatter(logging.Formatter):
         })
 
 
-def setup_logger() -> logging.Logger:
+def setup_logger():
     logger = logging.getLogger("GasMonitor")
 
     if logger.handlers:
@@ -93,14 +94,13 @@ def setup_logger() -> logging.Logger:
     logger.propagate = False
 
     formatter = JsonFormatter() if CFG.OUTPUT_JSON else logging.Formatter(
-        "%(asctime)s | %(levelname)-8s | %(message)s"
+        "%(asctime)s | %(levelname)-7s | %(message)s"
     )
 
     file_handler = RotatingFileHandler(
         CFG.LOG_FILE,
         maxBytes=5_000_000,
-        backupCount=3,
-        encoding="utf-8"
+        backupCount=3
     )
     file_handler.setFormatter(formatter)
 
@@ -117,7 +117,7 @@ logger = setup_logger()
 
 
 # ============================================================
-# RETRY
+# ERRORS
 # ============================================================
 
 RETRY_ERRORS: tuple[Type[Exception], ...] = (
@@ -129,111 +129,54 @@ RETRY_ERRORS: tuple[Type[Exception], ...] = (
 )
 
 
-def retry(fn: Callable[..., Any]) -> Callable[..., Any]:
-    @wraps(fn)
-    def wrapper(*args: Any, **kwargs: Any):
-
-        delay = CFG.RETRY_BASE_DELAY
-
-        for attempt in range(1, CFG.RETRY_LIMIT + 1):
-            try:
-                return fn(*args, **kwargs)
-
-            except RETRY_ERRORS as e:
-
-                client: Web3Client = args[0]
-                client.penalize_current()
-
-                if attempt >= CFG.RETRY_LIMIT:
-                    raise
-
-                jitter = random.uniform(0.7, 1.3)
-                sleep_time = min(delay * jitter, CFG.RETRY_MAX_DELAY)
-
-                logger.warning(
-                    "Retry %d/%d in %.2fs (%s)",
-                    attempt,
-                    CFG.RETRY_LIMIT,
-                    sleep_time,
-                    e,
-                )
-
-                time.sleep(sleep_time)
-                delay *= 2
-
-    return wrapper
-
-
 # ============================================================
-# PROVIDER HEALTH
+# PROVIDER WITH CIRCUIT BREAKER
 # ============================================================
 
 @dataclass
 class Provider:
     url: str
     score: int = 0
-    cooldown_until: float = 0
-    last_decay: float = field(default_factory=time.time)
+    latency: float = 1.0
+    state: str = "closed"  # closed | open | half-open
+    last_fail: float = 0
 
-    def healthy(self) -> bool:
-        self._decay()
-
-        if time.time() < self.cooldown_until:
-            return False
-
-        return self.score < CFG.MAX_PROVIDER_SCORE
-
-    def penalize(self):
-        self.score += 1
-        self.cooldown_until = time.time() + CFG.PROVIDER_COOLDOWN
-
-    def recover(self):
-        if self.score > 0:
-            self.score -= 1
-
-    def _decay(self):
+    def available(self) -> bool:
         now = time.time()
 
-        if now - self.last_decay > CFG.SCORE_DECAY_TIME:
-            if self.score > 0:
-                self.score -= 1
-            self.last_decay = now
+        if self.state == "open":
+            if now - self.last_fail > CFG.HALF_OPEN_AFTER:
+                self.state = "half-open"
+                return True
+            return False
+
+        return True
+
+    def success(self, latency: float):
+        self.latency = latency * 0.7 + self.latency * 0.3
+        self.score = max(self.score - 1, 0)
+        self.state = "closed"
+
+    def fail(self):
+        self.score += 1
+        self.last_fail = time.time()
+
+        if self.score >= CFG.MAX_PROVIDER_SCORE:
+            self.state = "open"
 
 
 # ============================================================
-# WEB3 CLIENT (THREAD SAFE)
+# WEB3 CLIENT (FAST FAILOVER)
 # ============================================================
 
 class Web3Client:
 
     def __init__(self, primary: str, fallbacks: List[str]):
-
         self.providers = [Provider(primary), *[Provider(p) for p in fallbacks]]
-
-        self.web3: Optional[Web3] = None
-        self.current: Optional[Provider] = None
-
         self.session = requests.Session()
-        self.lock = threading.Lock()
 
-    def _select_provider(self) -> Provider:
-
-        healthy = [p for p in self.providers if p.healthy()]
-
-        if not healthy:
-            raise ConnectionError("No healthy providers available")
-
-        weights = [(CFG.MAX_PROVIDER_SCORE - p.score) + 1 for p in healthy]
-
-        return random.choices(healthy, weights=weights, k=1)[0]
-
-    def _connect(self):
-
-        provider = self._select_provider()
-
-        logger.info("Connecting to %s", provider.url)
-
-        w3 = Web3(
+    def _make_web3(self, provider: Provider) -> Web3:
+        return Web3(
             Web3.HTTPProvider(
                 provider.url,
                 request_kwargs={
@@ -243,48 +186,109 @@ class Web3Client:
             )
         )
 
-        if not w3.is_connected():
-            provider.penalize()
-            raise ConnectionError("Provider connection failed")
+    def _probe(self, provider: Provider):
+        start = time.time()
 
-        self.web3 = w3
-        self.current = provider
-        provider.recover()
+        try:
+            w3 = self._make_web3(provider)
 
-    def get(self) -> Web3:
-        with self.lock:
-            if self.web3 and self.web3.is_connected():
-                return self.web3
+            if not w3.is_connected():
+                raise ConnectionError("not connected")
 
-            self._connect()
-            return self.web3
+            latency = time.time() - start
+            provider.success(latency)
 
-    def penalize_current(self):
-        with self.lock:
-            if self.current:
-                self.current.penalize()
+            return w3, provider, latency
 
-            self.web3 = None
-            self.current = None
+        except Exception:
+            provider.fail()
+            raise
+
+    def get_fastest(self) -> Web3:
+
+        available = [p for p in self.providers if p.available()]
+
+        if not available:
+            raise ConnectionError("No providers available")
+
+        # sort by latency + score
+        available.sort(key=lambda p: (p.score, p.latency))
+
+        selected = available[:CFG.PARALLEL_PROBES]
+
+        with ThreadPoolExecutor(max_workers=len(selected)) as executor:
+            futures = {executor.submit(self._probe, p): p for p in selected}
+
+            for future in as_completed(futures):
+                try:
+                    w3, provider, latency = future.result()
+
+                    logger.debug(
+                        "Using %s (latency=%.3fs score=%d)",
+                        provider.url,
+                        latency,
+                        provider.score
+                    )
+
+                    return w3
+
+                except Exception:
+                    continue
+
+        raise ConnectionError("All providers failed")
 
     def close(self):
         self.session.close()
 
 
 # ============================================================
-# GAS FETCH
+# RETRY WITH ROTATION
+# ============================================================
+
+def retry(fn: Callable[..., Any]):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+
+        delay = CFG.RETRY_BASE_DELAY
+
+        for attempt in range(1, CFG.RETRY_LIMIT + 1):
+            try:
+                return fn(*args, **kwargs)
+
+            except RETRY_ERRORS as e:
+
+                if attempt >= CFG.RETRY_LIMIT:
+                    raise
+
+                sleep = min(delay * random.uniform(0.7, 1.3), CFG.RETRY_MAX_DELAY)
+
+                logger.warning(
+                    "Retry %d/%d in %.2fs (%s)",
+                    attempt,
+                    CFG.RETRY_LIMIT,
+                    sleep,
+                    e,
+                )
+
+                time.sleep(sleep)
+                delay *= 2
+
+    return wrapper
+
+
+# ============================================================
+# GAS FETCH (IMPROVED)
 # ============================================================
 
 @retry
 def fetch_gas(client: Web3Client) -> Dict[str, Any]:
 
-    w3 = client.get()
+    w3 = client.get_fastest()
 
     block = w3.eth.get_block("pending")
 
     base_fee = block.get("baseFeePerGas")
 
-    # Legacy chain fallback
     if base_fee is None:
         gas_price = w3.eth.gas_price
         return {
@@ -296,13 +300,18 @@ def fetch_gas(client: Web3Client) -> Dict[str, Any]:
         }
 
     try:
+        # try native RPC
         priority_fee = w3.eth.max_priority_fee
-    except Exception:
-        gas_price = w3.eth.gas_price
-        priority_fee = max(gas_price - base_fee, 0)
 
-    # safer max fee formula (adds buffer)
-    max_fee = base_fee + (priority_fee * 2)
+    except Exception:
+        # fallback: estimate from history (more realistic than gas_price diff)
+        history = w3.eth.fee_history(5, "latest", [50])
+        rewards = [r[0] for r in history["reward"] if r]
+
+        priority_fee = int(sum(rewards) / len(rewards)) if rewards else int(1e9)
+
+    # safer fee
+    max_fee = base_fee + priority_fee * 2
 
     return {
         "gas_price_gwei": float(w3.from_wei(max_fee, "gwei")),
@@ -329,7 +338,7 @@ class GracefulShutdown:
         logger.info("Shutdown signal received")
         self.event.set()
 
-    def wait(self, timeout: int):
+    def wait(self, timeout):
         return self.event.wait(timeout)
 
     @property
