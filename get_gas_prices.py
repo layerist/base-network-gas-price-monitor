@@ -1,24 +1,35 @@
 #!/usr/bin/env python3
 """
-Ultra-Robust EVM Gas Price Monitor (v4)
+Ultra-Robust EVM Gas Price Monitor (v5)
 
-What this version improves:
-- Env-based provider list: PROVIDER_URLS / PROVIDER_URL / FALLBACK_PROVIDERS
-- Filters placeholder/empty provider URLs before startup
-- Per-provider Web3 + requests.Session keep-alive pools
-- Thread-safe circuit breaker with real cooldown and half-open probes
-- Race logic waits for the first successful provider, not merely the first finished one
-- Better fee estimation with safe fallback order
-- Optional RPC proxy support via RPC_PROXY / HTTPS_PROXY / HTTP_PROXY
-- Startup config validation
-- Cleaner JSON/text output
-- Graceful shutdown and provider cleanup
+Highlights:
+- Races the complete gas fetch, not a separate health check.
+- Per-provider circuit breaker with CLOSED / OPEN / HALF_OPEN states.
+- Provider failures are attributed to the provider that actually failed.
+- Uses monotonic clocks for latency, cooldowns, and scheduling.
+- Optional chain-id validation prevents accidental cross-chain RPC mixing.
+- EIP-1559 priority fee uses one configured reward percentile across blocks.
+- Bounds suspicious priority fees and supports minimum/maximum fee caps.
+- Reuses HTTP connections through one requests.Session per provider.
+- Redacts credentials/API keys from logs.
+- JSON output stays on stdout; logs stay on stderr/file.
+- Atomic interval scheduling avoids cumulative loop drift.
+- Graceful shutdown and deterministic cleanup.
+
+Dependencies:
+    pip install "web3>=6,<8" "requests>=2.31,<3"
+
+Typical environment:
+    PROVIDER_URLS=https://base.publicnode.com,https://base.llamarpc.com
+    EXPECTED_CHAIN_ID=8453
+    OUTPUT_JSON=true
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import random
 import signal
@@ -28,9 +39,11 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import dataclass, field
-from functools import wraps
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
+from enum import Enum
 from logging.handlers import RotatingFileHandler
-from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar, Callable, cast
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, TypeVar
+from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -40,51 +53,111 @@ from web3 import Web3
 from web3.exceptions import ProviderConnectionError, TimeExhausted
 
 
+APP_NAME = "GasMonitor"
+GWEI = Decimal(1_000_000_000)
+T = TypeVar("T")
+
+
 # ============================================================
-# CONFIG HELPERS
+# CONFIG
 # ============================================================
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+class ConfigError(ValueError):
+    """Raised when environment configuration is invalid."""
 
 
-def _env_int(name: str, default: int, min_value: Optional[int] = None) -> int:
+def env_text(name: str, default: str = "") -> str:
+    value = os.getenv(name)
+    return default if value is None else value.strip()
+
+
+def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None or not raw.strip():
         return default
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
-    if min_value is not None and value < min_value:
-        raise ValueError(f"{name} must be >= {min_value}, got {value}")
-    return value
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ConfigError(f"{name} must be a boolean, got {raw!r}")
 
 
-def _env_float(name: str, default: float, min_value: Optional[float] = None) -> float:
+def env_int(
+    name: str,
+    default: int,
+    *,
+    minimum: Optional[int] = None,
+    maximum: Optional[int] = None,
+) -> int:
     raw = os.getenv(name)
     if raw is None or not raw.strip():
-        return default
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a float, got {raw!r}") from exc
-    if min_value is not None and value < min_value:
-        raise ValueError(f"{name} must be >= {min_value}, got {value}")
+        value = default
+    else:
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ConfigError(f"{name} must be an integer, got {raw!r}") from exc
+
+    if minimum is not None and value < minimum:
+        raise ConfigError(f"{name} must be >= {minimum}, got {value}")
+    if maximum is not None and value > maximum:
+        raise ConfigError(f"{name} must be <= {maximum}, got {value}")
     return value
 
 
-def _split_csv(value: str) -> List[str]:
-    return [item.strip() for item in value.split(",") if item.strip()]
+def env_float(
+    name: str,
+    default: float,
+    *,
+    minimum: Optional[float] = None,
+    maximum: Optional[float] = None,
+) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        value = default
+    else:
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise ConfigError(f"{name} must be a number, got {raw!r}") from exc
+
+    if not math.isfinite(value):
+        raise ConfigError(f"{name} must be finite, got {value}")
+    if minimum is not None and value < minimum:
+        raise ConfigError(f"{name} must be >= {minimum}, got {value}")
+    if maximum is not None and value > maximum:
+        raise ConfigError(f"{name} must be <= {maximum}, got {value}")
+    return value
 
 
-def _unique(items: Iterable[str]) -> Tuple[str, ...]:
+def env_decimal(
+    name: str,
+    default: str,
+    *,
+    minimum: Optional[Decimal] = None,
+) -> Decimal:
+    raw = env_text(name, default)
+    try:
+        value = Decimal(raw)
+    except InvalidOperation as exc:
+        raise ConfigError(f"{name} must be a decimal number, got {raw!r}") from exc
+
+    if not value.is_finite():
+        raise ConfigError(f"{name} must be finite, got {value}")
+    if minimum is not None and value < minimum:
+        raise ConfigError(f"{name} must be >= {minimum}, got {value}")
+    return value
+
+
+def split_csv(value: str) -> list[str]:
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def unique(items: Iterable[str]) -> tuple[str, ...]:
     seen: set[str] = set()
-    result: List[str] = []
+    result: list[str] = []
     for item in items:
         if item not in seen:
             seen.add(item)
@@ -92,62 +165,149 @@ def _unique(items: Iterable[str]) -> Tuple[str, ...]:
     return tuple(result)
 
 
-def _is_usable_url(url: str) -> bool:
-    if not url:
+def usable_http_url(value: str) -> bool:
+    if not value:
         return False
-    lowered = url.lower()
-    if "your_project_id" in lowered or "your-api-key" in lowered or "api_key" in lowered:
+
+    lowered = value.lower()
+    placeholders = (
+        "your_project_id",
+        "your-project-id",
+        "your_api_key",
+        "your-api-key",
+        "<api",
+        "${",
+    )
+    if any(marker in lowered for marker in placeholders):
         return False
-    return lowered.startswith(("http://", "https://"))
+
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+
+    return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Config:
-    # Prefer PROVIDER_URLS="url1,url2,url3". PROVIDER_URL is kept for backward compatibility.
-    provider_urls: Tuple[str, ...] = field(default_factory=lambda: _unique(
-        [
-            *_split_csv(os.getenv("PROVIDER_URLS", "")),
-            *([os.getenv("PROVIDER_URL", "").strip()] if os.getenv("PROVIDER_URL") else []),
-            *_split_csv(os.getenv("FALLBACK_PROVIDERS", "")),
-            "https://base.llamarpc.com",
-            "https://base-mainnet.public.blastapi.io",
-            "https://base.publicnode.com",
-        ]
-    ))
+    provider_urls: tuple[str, ...]
+    expected_chain_id: Optional[int]
 
-    http_timeout: float = field(default_factory=lambda: _env_float("HTTP_TIMEOUT", 8.0, 0.2))
-    monitor_interval: float = field(default_factory=lambda: _env_float("MONITOR_INTERVAL", 8.0, 0.1))
+    http_timeout: float
+    monitor_interval: float
+    parallel_requests: int
 
-    retry_limit: int = field(default_factory=lambda: _env_int("RETRY_LIMIT", 5, 1))
-    retry_base_delay: float = field(default_factory=lambda: _env_float("RETRY_BASE_DELAY", 0.5, 0.0))
-    retry_max_delay: float = field(default_factory=lambda: _env_float("RETRY_MAX_DELAY", 10.0, 0.1))
+    retry_rounds: int
+    retry_base_delay: float
+    retry_max_delay: float
 
-    parallel_probes: int = field(default_factory=lambda: _env_int("PARALLEL_PROBES", 3, 1))
-    max_provider_score: int = field(default_factory=lambda: _env_int("MAX_PROVIDER_SCORE", 5, 1))
-    cooldown_sec: float = field(default_factory=lambda: _env_float("COOLDOWN", 60.0, 1.0))
-    half_open_after_sec: float = field(default_factory=lambda: _env_float("HALF_OPEN_AFTER", 25.0, 1.0))
+    failure_threshold: int
+    cooldown_seconds: float
+    latency_ewma_alpha: float
 
-    fee_history_blocks: int = field(default_factory=lambda: _env_int("FEE_HISTORY_BLOCKS", 10, 1))
-    fee_reward_percentiles: Tuple[float, ...] = (20.0, 50.0, 80.0)
-    max_fee_multiplier: float = field(default_factory=lambda: _env_float("MAX_FEE_MULTIPLIER", 1.25, 1.0))
-    fallback_priority_fee_gwei: float = field(default_factory=lambda: _env_float("FALLBACK_PRIORITY_FEE_GWEI", 1.0, 0.0))
+    fee_history_blocks: int
+    priority_percentile: float
+    fallback_priority_fee_gwei: Decimal
+    min_priority_fee_gwei: Decimal
+    max_priority_fee_gwei: Decimal
+    max_fee_multiplier: Decimal
+    max_fee_cap_gwei: Decimal
 
-    rpc_proxy: str = os.getenv("RPC_PROXY", "").strip()
-    log_file: str = os.getenv("LOG_FILE", "gas_monitor.log").strip()
-    log_level: str = os.getenv("LOG_LEVEL", "INFO").strip().upper()
-    output_json: bool = field(default_factory=lambda: _env_bool("OUTPUT_JSON", False))
+    block_tag: str
+    rpc_proxy: str
+    trust_env_proxy: bool
 
-    def validated_provider_urls(self) -> Tuple[str, ...]:
-        urls = tuple(url for url in self.provider_urls if _is_usable_url(url))
+    output_json: bool
+    log_json: bool
+    log_level: str
+    log_file: str
+    log_max_bytes: int
+    log_backups: int
+
+    @classmethod
+    def from_env(cls) -> "Config":
+        raw_urls = unique(
+            [
+                *split_csv(env_text("PROVIDER_URLS")),
+                *([env_text("PROVIDER_URL")] if env_text("PROVIDER_URL") else []),
+                *split_csv(env_text("FALLBACK_PROVIDERS")),
+                "https://base.llamarpc.com",
+                "https://base-mainnet.public.blastapi.io",
+                "https://base.publicnode.com",
+            ]
+        )
+        urls = tuple(url for url in raw_urls if usable_http_url(url))
         if not urls:
-            raise ValueError(
-                "No usable RPC providers. Set PROVIDER_URLS='https://rpc1,https://rpc2' "
-                "or PROVIDER_URL='https://rpc'."
+            raise ConfigError(
+                "No usable RPC endpoints. Set PROVIDER_URLS='https://rpc1,https://rpc2'."
             )
-        return urls
 
+        expected_chain_raw = env_text("EXPECTED_CHAIN_ID")
+        expected_chain_id = (
+            env_int("EXPECTED_CHAIN_ID", 1, minimum=1)
+            if expected_chain_raw
+            else None
+        )
 
-CFG = Config()
+        cfg = cls(
+            provider_urls=urls,
+            expected_chain_id=expected_chain_id,
+            http_timeout=env_float("HTTP_TIMEOUT", 8.0, minimum=0.2),
+            monitor_interval=env_float("MONITOR_INTERVAL", 8.0, minimum=0.1),
+            parallel_requests=env_int("PARALLEL_REQUESTS", 3, minimum=1),
+            retry_rounds=env_int("RETRY_ROUNDS", 3, minimum=1),
+            retry_base_delay=env_float("RETRY_BASE_DELAY", 0.4, minimum=0.0),
+            retry_max_delay=env_float("RETRY_MAX_DELAY", 8.0, minimum=0.1),
+            failure_threshold=env_int("FAILURE_THRESHOLD", 3, minimum=1),
+            cooldown_seconds=env_float("COOLDOWN_SECONDS", 30.0, minimum=0.1),
+            latency_ewma_alpha=env_float(
+                "LATENCY_EWMA_ALPHA", 0.25, minimum=0.01, maximum=1.0
+            ),
+            fee_history_blocks=env_int("FEE_HISTORY_BLOCKS", 10, minimum=1, maximum=1024),
+            priority_percentile=env_float(
+                "PRIORITY_PERCENTILE", 50.0, minimum=0.0, maximum=100.0
+            ),
+            fallback_priority_fee_gwei=env_decimal(
+                "FALLBACK_PRIORITY_FEE_GWEI", "0.001", minimum=Decimal(0)
+            ),
+            min_priority_fee_gwei=env_decimal(
+                "MIN_PRIORITY_FEE_GWEI", "0", minimum=Decimal(0)
+            ),
+            max_priority_fee_gwei=env_decimal(
+                "MAX_PRIORITY_FEE_GWEI", "5", minimum=Decimal(0)
+            ),
+            max_fee_multiplier=env_decimal(
+                "MAX_FEE_MULTIPLIER", "1.25", minimum=Decimal(1)
+            ),
+            max_fee_cap_gwei=env_decimal(
+                "MAX_FEE_CAP_GWEI", "0", minimum=Decimal(0)
+            ),
+            block_tag=env_text("BLOCK_TAG", "pending").lower(),
+            rpc_proxy=env_text("RPC_PROXY"),
+            trust_env_proxy=env_bool("TRUST_ENV_PROXY", True),
+            output_json=env_bool("OUTPUT_JSON", False),
+            log_json=env_bool("LOG_JSON", False),
+            log_level=env_text("LOG_LEVEL", "INFO").upper(),
+            log_file=env_text("LOG_FILE", "gas_monitor.log"),
+            log_max_bytes=env_int("LOG_MAX_BYTES", 5_000_000, minimum=0),
+            log_backups=env_int("LOG_BACKUPS", 3, minimum=0),
+        )
+
+        if cfg.block_tag not in {"latest", "pending", "safe", "finalized"}:
+            raise ConfigError(
+                "BLOCK_TAG must be latest, pending, safe, or finalized"
+            )
+        if cfg.retry_max_delay < cfg.retry_base_delay:
+            raise ConfigError("RETRY_MAX_DELAY must be >= RETRY_BASE_DELAY")
+        if cfg.max_priority_fee_gwei and (
+            cfg.min_priority_fee_gwei > cfg.max_priority_fee_gwei
+        ):
+            raise ConfigError(
+                "MIN_PRIORITY_FEE_GWEI must be <= MAX_PRIORITY_FEE_GWEI"
+            )
+
+        return cfg
 
 
 # ============================================================
@@ -157,301 +317,544 @@ CFG = Config()
 
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
-        payload = {
-            "timestamp": self.formatTime(record),
+        payload: dict[str, Any] = {
+            "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
         }
         if record.exc_info:
-            payload["exc_info"] = self.formatException(record.exc_info)
-        return json.dumps(payload, ensure_ascii=False)
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
-def setup_logger() -> logging.Logger:
-    logger_ = logging.getLogger("GasMonitor")
-    if logger_.handlers:
-        return logger_
-
-    logger_.setLevel(getattr(logging, CFG.log_level, logging.INFO))
+def setup_logger(cfg: Config) -> logging.Logger:
+    logger_ = logging.getLogger(APP_NAME)
+    logger_.handlers.clear()
+    logger_.setLevel(getattr(logging, cfg.log_level, logging.INFO))
     logger_.propagate = False
 
-    formatter: logging.Formatter = JsonFormatter() if CFG.output_json else logging.Formatter(
-        "%(asctime)s | %(levelname)-8s | %(message)s"
-    )
+    formatter: logging.Formatter
+    if cfg.log_json:
+        formatter = JsonFormatter()
+    else:
+        formatter = logging.Formatter(
+            "%(asctime)s | %(levelname)-8s | %(message)s"
+        )
 
-    if CFG.log_file:
-        file_handler = RotatingFileHandler(CFG.log_file, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+    # StreamHandler writes to stderr, preserving stdout for machine-readable output.
+    console = logging.StreamHandler(sys.stderr)
+    console.setFormatter(formatter)
+    logger_.addHandler(console)
+
+    if cfg.log_file:
+        file_handler = RotatingFileHandler(
+            cfg.log_file,
+            maxBytes=cfg.log_max_bytes,
+            backupCount=cfg.log_backups,
+            encoding="utf-8",
+        )
         file_handler.setFormatter(formatter)
         logger_.addHandler(file_handler)
-
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    logger_.addHandler(console_handler)
 
     return logger_
 
 
-logger = setup_logger()
-
-
 # ============================================================
-# ERRORS / RETRY
+# PROVIDERS / CIRCUIT BREAKER
 # ============================================================
 
 
-RETRY_ERRORS: Tuple[type[Exception], ...] = (
-    Timeout,
-    TimeExhausted,
-    ProviderConnectionError,
-    RequestException,
-    ConnectionError,
-    ValueError,
-)
-
-F = TypeVar("F", bound=Callable[..., Any])
+class CircuitState(str, Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half-open"
 
 
-def retry(fn: F) -> F:
-    @wraps(fn)
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        sleep = CFG.retry_base_delay
-
-        for attempt in range(1, CFG.retry_limit + 1):
-            try:
-                return fn(*args, **kwargs)
-            except RETRY_ERRORS as exc:
-                if attempt >= CFG.retry_limit:
-                    raise
-
-                upper = max(CFG.retry_base_delay, sleep * 3)
-                sleep = min(random.uniform(CFG.retry_base_delay, upper), CFG.retry_max_delay)
-
-                logger.warning(
-                    "Retry %d/%d in %.2fs: %s",
-                    attempt,
-                    CFG.retry_limit,
-                    sleep,
-                    exc,
-                )
-                time.sleep(sleep)
-
-        raise RuntimeError("unreachable retry state")
-
-    return cast(F, wrapper)
+class RpcError(RuntimeError):
+    """A provider-specific RPC operation failed."""
 
 
-# ============================================================
-# HTTP / WEB3 PROVIDERS
-# ============================================================
+class WrongChainError(RpcError):
+    """RPC endpoint belongs to another chain."""
 
 
-def build_session(proxy: str = "") -> requests.Session:
+def redact_url(url: str) -> str:
+    """Hide credentials, query values, and long path API keys in logs."""
+    try:
+        parsed = urlsplit(url)
+        host = parsed.hostname or "unknown"
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+
+        path_parts = [part for part in parsed.path.split("/") if part]
+        safe_parts: list[str] = []
+        for part in path_parts:
+            if len(part) > 12:
+                safe_parts.append("***")
+            else:
+                safe_parts.append(part)
+
+        safe_path = "/" + "/".join(safe_parts) if safe_parts else ""
+        safe = SplitResult(parsed.scheme, host, safe_path, "", "")
+        return urlunsplit(safe)
+    except Exception:
+        return "<redacted-rpc>"
+
+
+def build_session(cfg: Config) -> requests.Session:
     session = requests.Session()
 
-    # Web3 calls are idempotent reads here; we keep urllib retries disabled and use our own retry layer.
-    retry_cfg = Retry(total=0, connect=0, read=0, redirect=0)
-    adapter = HTTPAdapter(pool_connections=32, pool_maxsize=64, max_retries=retry_cfg)
-
+    # Retries are handled at the provider-race level, not hidden inside urllib3.
+    no_retry = Retry(total=0, connect=0, read=0, redirect=0, status=0)
+    adapter = HTTPAdapter(
+        pool_connections=8,
+        pool_maxsize=max(4, cfg.parallel_requests * 2),
+        max_retries=no_retry,
+        pool_block=False,
+    )
     session.mount("http://", adapter)
     session.mount("https://", adapter)
-    session.headers.update({"Connection": "keep-alive", "Accept": "application/json"})
+    session.headers.update(
+        {
+            "Accept": "application/json",
+            "User-Agent": f"{APP_NAME}/5",
+        }
+    )
 
-    if proxy:
+    session.trust_env = cfg.trust_env_proxy
+    if cfg.rpc_proxy:
         session.trust_env = False
-        session.proxies.update({"http": proxy, "https": proxy})
+        session.proxies.update({"http": cfg.rpc_proxy, "https": cfg.rpc_proxy})
 
     return session
 
 
-@dataclass
+@dataclass(slots=True)
 class Provider:
     url: str
+    safe_url: str
     session: requests.Session
     w3: Web3
-    latency: float = 1.0
-    score: int = 0
-    state: str = "closed"  # closed | open | half-open
-    last_fail: float = 0.0
-    half_open_probe: bool = False
-    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    state: CircuitState = CircuitState.CLOSED
+    consecutive_failures: int = 0
+    total_successes: int = 0
+    total_failures: int = 0
+    latency_ewma: float = 1.0
+    opened_at: float = 0.0
+    in_flight: bool = False
+    last_error: str = ""
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @classmethod
-    def create(cls, url: str) -> "Provider":
-        session = build_session(CFG.rpc_proxy)
-        w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": CFG.http_timeout, "session": session}))
-        return cls(url=url, session=session, w3=w3)
+    def create(cls, url: str, cfg: Config) -> "Provider":
+        session = build_session(cfg)
+        provider = Web3.HTTPProvider(
+            url,
+            request_kwargs={
+                "timeout": (cfg.http_timeout, cfg.http_timeout),
+            },
+            session=session,
+        )
+        return cls(
+            url=url,
+            safe_url=redact_url(url),
+            session=session,
+            w3=Web3(provider),
+        )
 
-    def available(self) -> bool:
+    def try_acquire(self, now: float, cfg: Config) -> bool:
         with self.lock:
-            now = time.time()
+            if self.in_flight:
+                return False
 
-            if self.state == "closed":
-                return True
-
-            if self.state == "open":
-                cooldown = max(CFG.cooldown_sec, CFG.half_open_after_sec)
-                if now - self.last_fail < cooldown:
+            if self.state is CircuitState.OPEN:
+                if now - self.opened_at < cfg.cooldown_seconds:
                     return False
-                self.state = "half-open"
+                self.state = CircuitState.HALF_OPEN
 
-            if self.state == "half-open":
-                if self.half_open_probe:
-                    return False
-                self.half_open_probe = True
+            if self.state in {CircuitState.CLOSED, CircuitState.HALF_OPEN}:
+                self.in_flight = True
                 return True
 
             return False
 
-    def success(self, latency: float) -> None:
+    def record_success(self, latency: float, cfg: Config) -> None:
         with self.lock:
-            alpha = 0.25
-            self.latency = alpha * latency + (1 - alpha) * self.latency
-            self.score = max(0, self.score - 1)
-            self.state = "closed"
-            self.half_open_probe = False
+            alpha = cfg.latency_ewma_alpha
+            self.latency_ewma = (
+                alpha * latency + (1.0 - alpha) * self.latency_ewma
+            )
+            self.consecutive_failures = 0
+            self.total_successes += 1
+            self.state = CircuitState.CLOSED
+            self.in_flight = False
+            self.last_error = ""
 
-    def fail(self) -> None:
+    def record_failure(self, error: BaseException, cfg: Config) -> None:
         with self.lock:
-            self.score += 1
-            self.last_fail = time.time()
-            self.half_open_probe = False
-            if self.score >= CFG.max_provider_score:
-                self.state = "open"
+            self.consecutive_failures += 1
+            self.total_failures += 1
+            self.last_error = f"{type(error).__name__}: {error}"
+            self.in_flight = False
+
+            if (
+                self.state is CircuitState.HALF_OPEN
+                or self.consecutive_failures >= cfg.failure_threshold
+            ):
+                self.state = CircuitState.OPEN
+                self.opened_at = time.monotonic()
+
+    def ranking(self) -> tuple[int, int, float, int]:
+        with self.lock:
+            state_rank = {
+                CircuitState.CLOSED: 0,
+                CircuitState.HALF_OPEN: 1,
+                CircuitState.OPEN: 2,
+            }[self.state]
+            return (
+                state_rank,
+                self.consecutive_failures,
+                self.latency_ewma,
+                self.total_failures,
+            )
+
+    def release_unstarted(self) -> None:
+        """Release a provider when its queued future was cancelled before execution."""
+        with self.lock:
+            self.in_flight = False
 
     def close(self) -> None:
         self.session.close()
 
 
-class Web3Client:
-    def __init__(self, urls: Iterable[str]) -> None:
-        unique_urls = list(_unique(urls))
-        random.shuffle(unique_urls)
+# ============================================================
+# FEE CALCULATION
+# ============================================================
 
-        self.providers = [Provider.create(url) for url in unique_urls]
-        self.executor = ThreadPoolExecutor(max_workers=max(CFG.parallel_probes, len(self.providers)))
 
-        logger.info("Loaded %d RPC provider(s)", len(self.providers))
+def decimal_to_wei(value_gwei: Decimal) -> int:
+    return int((value_gwei * GWEI).to_integral_value(rounding=ROUND_CEILING))
 
-    def _probe(self, provider: Provider) -> Tuple[Web3, Provider, float, int]:
-        start = time.perf_counter()
-        try:
-            # block_number is enough as a lightweight health check and avoids an extra is_connected RPC call.
-            block_number = provider.w3.eth.block_number
-            latency = time.perf_counter() - start
-            provider.success(latency)
-            return provider.w3, provider, latency, int(block_number)
-        except Exception:
-            provider.fail()
-            raise
 
-    def get_fastest(self) -> Web3:
-        available = [provider for provider in self.providers if provider.available()]
-        if not available:
-            raise ConnectionError("No healthy RPC providers")
+def wei_to_gwei_text(value_wei: int) -> str:
+    value = Decimal(int(value_wei)) / GWEI
+    # Fixed-point output avoids scientific notation and float precision loss.
+    return format(value.normalize(), "f")
 
-        available.sort(key=lambda provider: (provider.score, provider.latency))
-        selected = available[: min(CFG.parallel_probes, len(available))]
 
-        futures: Dict[Future[Tuple[Web3, Provider, float, int]], Provider] = {
-            self.executor.submit(self._probe, provider): provider for provider in selected
+def clamp(value: int, minimum: int, maximum: int) -> int:
+    if maximum > 0:
+        return min(maximum, max(minimum, value))
+    return max(minimum, value)
+
+
+def median_int(values: Sequence[int]) -> int:
+    if not values:
+        raise ValueError("median_int requires at least one value")
+    return int(statistics.median(values))
+
+
+@dataclass(frozen=True, slots=True)
+class GasQuote:
+    tx_type: str
+    chain_id: int
+    provider: str
+    block_tag: str
+    block_number: Optional[int]
+    gas_price_wei: int
+    base_fee_wei: Optional[int]
+    priority_fee_wei: Optional[int]
+    max_fee_wei: Optional[int]
+    priority_source: Optional[str]
+    latency_ms: int
+    timestamp: int
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "type": self.tx_type,
+            "chain_id": self.chain_id,
+            "provider": self.provider,
+            "block_tag": self.block_tag,
+            "block": self.block_number,
+            "gas_price_wei": self.gas_price_wei,
+            "gas_price_gwei": wei_to_gwei_text(self.gas_price_wei),
+            "base_fee_wei": self.base_fee_wei,
+            "base_fee_gwei": (
+                wei_to_gwei_text(self.base_fee_wei)
+                if self.base_fee_wei is not None
+                else None
+            ),
+            "priority_fee_wei": self.priority_fee_wei,
+            "priority_fee_gwei": (
+                wei_to_gwei_text(self.priority_fee_wei)
+                if self.priority_fee_wei is not None
+                else None
+            ),
+            "max_fee_wei": self.max_fee_wei,
+            "max_fee_gwei": (
+                wei_to_gwei_text(self.max_fee_wei)
+                if self.max_fee_wei is not None
+                else None
+            ),
+            "priority_source": self.priority_source,
+            "latency_ms": self.latency_ms,
+            "timestamp": self.timestamp,
         }
 
-        last_error: Optional[BaseException] = None
-        pending = set(futures)
+
+def estimate_priority_fee(w3: Web3, cfg: Config) -> tuple[int, str]:
+    minimum = decimal_to_wei(cfg.min_priority_fee_gwei)
+    maximum = decimal_to_wei(cfg.max_priority_fee_gwei)
+
+    try:
+        history: Mapping[str, Any] = w3.eth.fee_history(
+            cfg.fee_history_blocks,
+            "latest",
+            [cfg.priority_percentile],
+        )
+        rewards: list[int] = []
+        for row in history.get("reward", []):
+            if row:
+                value = int(row[0])
+                if value >= 0:
+                    rewards.append(value)
+
+        if rewards:
+            return clamp(median_int(rewards), minimum, maximum), "fee_history"
+    except Exception:
+        pass
+
+    try:
+        value = int(w3.eth.max_priority_fee)
+        return clamp(value, minimum, maximum), "eth_maxPriorityFeePerGas"
+    except Exception:
+        fallback = decimal_to_wei(cfg.fallback_priority_fee_gwei)
+        return clamp(fallback, minimum, maximum), "configured_fallback"
+
+
+def fetch_quote(provider: Provider, cfg: Config) -> GasQuote:
+    started = time.perf_counter()
+    w3 = provider.w3
+
+    chain_id = int(w3.eth.chain_id)
+    if cfg.expected_chain_id is not None and chain_id != cfg.expected_chain_id:
+        raise WrongChainError(
+            f"expected chain {cfg.expected_chain_id}, got {chain_id}"
+        )
+
+    block: Mapping[str, Any] = w3.eth.get_block(cfg.block_tag)
+    base_fee_raw = block.get("baseFeePerGas")
+    block_number_raw = block.get("number")
+    block_number = (
+        int(block_number_raw) if block_number_raw is not None else None
+    )
+
+    latency_ms = round((time.perf_counter() - started) * 1000)
+
+    if base_fee_raw is None:
+        gas_price = int(w3.eth.gas_price)
+        return GasQuote(
+            tx_type="legacy",
+            chain_id=chain_id,
+            provider=provider.safe_url,
+            block_tag=cfg.block_tag,
+            block_number=block_number,
+            gas_price_wei=gas_price,
+            base_fee_wei=None,
+            priority_fee_wei=None,
+            max_fee_wei=None,
+            priority_source=None,
+            latency_ms=latency_ms,
+            timestamp=int(time.time()),
+        )
+
+    base_fee = int(base_fee_raw)
+    priority_fee, priority_source = estimate_priority_fee(w3, cfg)
+
+    multiplier_scaled = int(
+        (Decimal(base_fee) * cfg.max_fee_multiplier).to_integral_value(
+            rounding=ROUND_CEILING
+        )
+    )
+    max_fee = multiplier_scaled + priority_fee
+
+    cap = decimal_to_wei(cfg.max_fee_cap_gwei)
+    if cap > 0:
+        # Never cap below the amount required to include the current base fee + tip.
+        max_fee = max(base_fee + priority_fee, min(max_fee, cap))
+
+    return GasQuote(
+        tx_type="eip1559",
+        chain_id=chain_id,
+        provider=provider.safe_url,
+        block_tag=cfg.block_tag,
+        block_number=block_number,
+        gas_price_wei=max_fee,
+        base_fee_wei=base_fee,
+        priority_fee_wei=priority_fee,
+        max_fee_wei=max_fee,
+        priority_source=priority_source,
+        latency_ms=latency_ms,
+        timestamp=int(time.time()),
+    )
+
+
+TRANSIENT_ERRORS: tuple[type[BaseException], ...] = (
+    Timeout,
+    TimeExhausted,
+    ProviderConnectionError,
+    RequestException,
+    ConnectionError,
+    OSError,
+    ValueError,
+)
+
+
+class RpcPool:
+    def __init__(self, cfg: Config, logger: logging.Logger) -> None:
+        self.cfg = cfg
+        self.logger = logger
+
+        urls = list(cfg.provider_urls)
+        random.shuffle(urls)
+        self.providers = [Provider.create(url, cfg) for url in urls]
+        self.executor = ThreadPoolExecutor(
+            max_workers=min(
+                len(self.providers),
+                max(cfg.parallel_requests, 1),
+            ),
+            thread_name_prefix="rpc",
+        )
+
+        logger.info(
+            "Loaded %d RPC provider(s); parallel=%d; expected_chain_id=%s",
+            len(self.providers),
+            min(cfg.parallel_requests, len(self.providers)),
+            cfg.expected_chain_id if cfg.expected_chain_id is not None else "any",
+        )
+
+    def _run_provider(self, provider: Provider) -> GasQuote:
+        started = time.perf_counter()
+        try:
+            quote = fetch_quote(provider, self.cfg)
+        except BaseException as exc:
+            provider.record_failure(exc, self.cfg)
+            raise
+        else:
+            provider.record_success(time.perf_counter() - started, self.cfg)
+            return quote
+
+    def _candidates(self) -> list[Provider]:
+        now = time.monotonic()
+        ordered = sorted(self.providers, key=Provider.ranking)
+
+        acquired: list[Provider] = []
+        for provider in ordered:
+            if provider.try_acquire(now, self.cfg):
+                acquired.append(provider)
+                if len(acquired) >= self.cfg.parallel_requests:
+                    break
+        return acquired
+
+    def fetch_once(self) -> GasQuote:
+        candidates = self._candidates()
+        if not candidates:
+            next_retry = min(
+                (
+                    max(
+                        0.0,
+                        p.opened_at
+                        + self.cfg.cooldown_seconds
+                        - time.monotonic(),
+                    )
+                    for p in self.providers
+                    if p.state is CircuitState.OPEN
+                ),
+                default=self.cfg.cooldown_seconds,
+            )
+            raise RpcError(
+                f"No RPC provider is currently available; next half-open probe "
+                f"in about {next_retry:.1f}s"
+            )
+
+        futures: dict[Future[GasQuote], Provider] = {
+            self.executor.submit(self._run_provider, provider): provider
+            for provider in candidates
+        }
+        pending: set[Future[GasQuote]] = set(futures)
+        errors: list[str] = []
 
         while pending:
             done, pending = wait(pending, return_when=FIRST_COMPLETED)
+
             for future in done:
                 provider = futures[future]
                 try:
-                    w3, selected_provider, latency, block_number = future.result()
-                    for pending_future in pending:
-                        pending_future.cancel()
-                    logger.debug(
-                        "Selected RPC %s | latency=%.3fs | score=%d | block=%s",
-                        selected_provider.url,
-                        latency,
-                        selected_provider.score,
-                        block_number,
-                    )
-                    return w3
+                    quote = future.result()
                 except BaseException as exc:
-                    last_error = exc
-                    logger.debug("RPC probe failed for %s: %s", provider.url, exc)
+                    errors.append(
+                        f"{provider.safe_url}: {type(exc).__name__}: {exc}"
+                    )
+                    self.logger.debug(
+                        "RPC failed | provider=%s | error=%s",
+                        provider.safe_url,
+                        exc,
+                    )
+                    continue
 
-        raise ConnectionError(f"All selected RPC providers failed: {last_error}")
+                # Running HTTP calls cannot reliably be cancelled. They may finish
+                # in the background and update their own provider health.
+                for other in pending:
+                    if other.cancel():
+                        futures[other].release_unstarted()
+
+                self.logger.debug(
+                    "RPC selected | provider=%s | latency=%dms | block=%s",
+                    quote.provider,
+                    quote.latency_ms,
+                    quote.block_number,
+                )
+                return quote
+
+        detail = "; ".join(errors[-3:]) or "unknown error"
+        raise RpcError(f"All selected RPC providers failed: {detail}")
+
+    def fetch_with_retries(self) -> GasQuote:
+        delay = self.cfg.retry_base_delay
+        last_error: Optional[BaseException] = None
+
+        for round_number in range(1, self.cfg.retry_rounds + 1):
+            try:
+                return self.fetch_once()
+            except TRANSIENT_ERRORS + (RpcError,) as exc:
+                last_error = exc
+                if round_number >= self.cfg.retry_rounds:
+                    break
+
+                upper = max(self.cfg.retry_base_delay, delay * 3.0)
+                delay = min(
+                    random.uniform(self.cfg.retry_base_delay, upper),
+                    self.cfg.retry_max_delay,
+                )
+                self.logger.warning(
+                    "Gas fetch round %d/%d failed; retrying in %.2fs: %s",
+                    round_number,
+                    self.cfg.retry_rounds,
+                    delay,
+                    exc,
+                )
+                time.sleep(delay)
+
+        raise RpcError(
+            f"Gas fetch failed after {self.cfg.retry_rounds} round(s): {last_error}"
+        ) from last_error
 
     def close(self) -> None:
-        self.executor.shutdown(wait=False, cancel_futures=True)
+        self.executor.shutdown(wait=True, cancel_futures=True)
         for provider in self.providers:
             provider.close()
-
-
-# ============================================================
-# GAS FETCH
-# ============================================================
-
-
-def _wei_to_gwei(w3: Web3, value_wei: int) -> float:
-    return float(w3.from_wei(int(value_wei), "gwei"))
-
-
-def _estimate_priority_fee(w3: Web3) -> int:
-    try:
-        history = w3.eth.fee_history(
-            CFG.fee_history_blocks,
-            "latest",
-            list(CFG.fee_reward_percentiles),
-        )
-        rewards: List[int] = []
-        for row in history.get("reward", []):
-            rewards.extend(int(value) for value in row if int(value) > 0)
-        if rewards:
-            return int(statistics.median(rewards))
-    except Exception as exc:
-        logger.debug("fee_history failed: %s", exc)
-
-    try:
-        return int(w3.eth.max_priority_fee)
-    except Exception as exc:
-        logger.debug("max_priority_fee failed: %s", exc)
-
-    return int(CFG.fallback_priority_fee_gwei * 1_000_000_000)
-
-
-@retry
-def fetch_gas(client: Web3Client) -> Dict[str, Any]:
-    w3 = client.get_fastest()
-    block = w3.eth.get_block("pending")
-    base_fee = block.get("baseFeePerGas")
-    block_number = block.get("number")
-
-    if base_fee is None:
-        gas_price = int(w3.eth.gas_price)
-        return {
-            "type": "legacy",
-            "gas_price_gwei": _wei_to_gwei(w3, gas_price),
-            "base_fee_gwei": None,
-            "priority_fee_gwei": None,
-            "max_fee_gwei": None,
-            "block": block_number,
-            "timestamp": int(time.time()),
-        }
-
-    base_fee_int = int(base_fee)
-    priority_fee = _estimate_priority_fee(w3)
-    max_fee = int(base_fee_int * CFG.max_fee_multiplier + priority_fee)
-
-    return {
-        "type": "eip1559",
-        "gas_price_gwei": _wei_to_gwei(w3, max_fee),
-        "base_fee_gwei": _wei_to_gwei(w3, base_fee_int),
-        "priority_fee_gwei": _wei_to_gwei(w3, priority_fee),
-        "max_fee_gwei": _wei_to_gwei(w3, max_fee),
-        "block": block_number,
-        "timestamp": int(time.time()),
-    }
 
 
 # ============================================================
@@ -460,18 +863,20 @@ def fetch_gas(client: Web3Client) -> Dict[str, Any]:
 
 
 class GracefulShutdown:
-    def __init__(self) -> None:
+    def __init__(self, logger: logging.Logger) -> None:
         self.event = threading.Event()
-        for sig in (signal.SIGINT, getattr(signal, "SIGTERM", None)):
-            if sig is not None:
-                try:
-                    signal.signal(sig, self._handler)
-                except (ValueError, OSError):
-                    # Signal registration may fail outside the main thread or on some platforms.
-                    pass
+        self.logger = logger
 
-    def _handler(self, *_: Any) -> None:
-        logger.info("Shutdown signal received")
+        for sig in (signal.SIGINT, getattr(signal, "SIGTERM", None)):
+            if sig is None:
+                continue
+            try:
+                signal.signal(sig, self._handle)
+            except (ValueError, OSError):
+                pass
+
+    def _handle(self, signum: int, _frame: Any) -> None:
+        self.logger.info("Shutdown signal received: %s", signum)
         self.event.set()
 
     @property
@@ -479,54 +884,89 @@ class GracefulShutdown:
         return self.event.is_set()
 
     def wait(self, timeout: float) -> bool:
-        return self.event.wait(timeout)
+        return self.event.wait(max(0.0, timeout))
 
 
-def emit(data: Dict[str, Any]) -> None:
-    if CFG.output_json:
-        print(json.dumps(data, ensure_ascii=False), flush=True)
+def emit(quote: GasQuote, cfg: Config, logger: logging.Logger) -> None:
+    data = quote.as_dict()
+
+    if cfg.output_json:
+        print(
+            json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+            flush=True,
+        )
         return
 
+    if quote.tx_type == "eip1559":
+        logger.info(
+            "Gas %s gwei | base %s | tip %s | block %s | %dms | %s",
+            data["max_fee_gwei"],
+            data["base_fee_gwei"],
+            data["priority_fee_gwei"],
+            quote.block_number,
+            quote.latency_ms,
+            quote.provider,
+        )
+    else:
+        logger.info(
+            "Gas %s gwei | legacy | block %s | %dms | %s",
+            data["gas_price_gwei"],
+            quote.block_number,
+            quote.latency_ms,
+            quote.provider,
+        )
+
+
+def monitor(cfg: Config, logger: logging.Logger) -> None:
+    shutdown = GracefulShutdown(logger)
+    pool = RpcPool(cfg, logger)
+
     logger.info(
-        "Gas %.4f gwei | base %.4f | tip %.4f | block %s | %s",
-        data["gas_price_gwei"],
-        data["base_fee_gwei"] or 0.0,
-        data["priority_fee_gwei"] or 0.0,
-        data["block"],
-        data["type"],
+        "Gas monitor started | interval=%.2fs | block_tag=%s",
+        cfg.monitor_interval,
+        cfg.block_tag,
     )
 
-
-def monitor() -> None:
-    urls = CFG.validated_provider_urls()
-    shutdown = GracefulShutdown()
-    client = Web3Client(urls)
-
-    logger.info("Gas monitor started | interval=%.2fs | probes=%d", CFG.monitor_interval, CFG.parallel_probes)
-
+    next_run = time.monotonic()
     try:
         while not shutdown.stopped:
             try:
-                emit(fetch_gas(client))
+                emit(pool.fetch_with_retries(), cfg, logger)
             except Exception as exc:
-                logger.exception("Fetch failed: %s", exc)
+                logger.error("Gas fetch failed: %s", exc, exc_info=True)
 
-            shutdown.wait(CFG.monitor_interval)
+            next_run += cfg.monitor_interval
+            now = time.monotonic()
+
+            # If a cycle took too long, skip missed slots instead of running a burst.
+            if next_run <= now:
+                missed = math.floor((now - next_run) / cfg.monitor_interval) + 1
+                next_run += missed * cfg.monitor_interval
+
+            shutdown.wait(next_run - time.monotonic())
     finally:
-        client.close()
+        pool.close()
         logger.info("Gas monitor stopped")
 
 
 def main() -> int:
     try:
-        monitor()
+        cfg = Config.from_env()
+    except ConfigError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 2
+
+    logger = setup_logger(cfg)
+
+    try:
+        monitor(cfg, logger)
         return 0
     except KeyboardInterrupt:
         return 130
     except Exception as exc:
-        logger.exception("Fatal error: %s", exc)
+        logger.critical("Fatal error: %s", exc, exc_info=True)
         return 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
