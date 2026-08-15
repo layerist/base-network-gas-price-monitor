@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """
-Ultra-Robust EVM Gas Price Monitor (v5)
+Ultra-Robust EVM Gas Price Monitor (v6)
 
 Highlights:
 - Races the complete gas fetch, not a separate health check.
 - Per-provider circuit breaker with CLOSED / OPEN / HALF_OPEN states.
 - Provider failures are attributed to the provider that actually failed.
 - Uses monotonic clocks for latency, cooldowns, and scheduling.
-- Optional chain-id validation prevents accidental cross-chain RPC mixing.
+- Safe provider defaults: built-in Base RPCs are used only when no custom RPC is configured.
+- Built-in Base defaults automatically enforce chain_id=8453 unless explicitly overridden.
+- Wrong-chain providers are permanently disabled for the current process.
 - EIP-1559 priority fee uses one configured reward percentile across blocks.
 - Bounds suspicious priority fees and supports minimum/maximum fee caps.
 - Reuses HTTP connections through one requests.Session per provider.
 - Redacts credentials/API keys from logs.
 - JSON output stays on stdout; logs stay on stderr/file.
+- Full quote latency includes priority-fee estimation.
+- Retry backoff is interruptible for faster graceful shutdown.
 - Atomic interval scheduling avoids cumulative loop drift.
 - Graceful shutdown and deterministic cleanup.
 
@@ -42,7 +46,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from enum import Enum
 from logging.handlers import RotatingFileHandler
-from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, TypeVar
+from typing import Any, Iterable, Mapping, Optional, Sequence
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import requests
@@ -55,7 +59,6 @@ from web3.exceptions import ProviderConnectionError, TimeExhausted
 
 APP_NAME = "GasMonitor"
 GWEI = Decimal(1_000_000_000)
-T = TypeVar("T")
 
 
 # ============================================================
@@ -227,28 +230,53 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
-        raw_urls = unique(
+        raw_custom_urls = unique(
             [
                 *split_csv(env_text("PROVIDER_URLS")),
                 *([env_text("PROVIDER_URL")] if env_text("PROVIDER_URL") else []),
                 *split_csv(env_text("FALLBACK_PROVIDERS")),
-                "https://base.llamarpc.com",
-                "https://base-mainnet.public.blastapi.io",
-                "https://base.publicnode.com",
             ]
         )
-        urls = tuple(url for url in raw_urls if usable_http_url(url))
+        invalid_custom_urls = tuple(
+            url for url in raw_custom_urls if not usable_http_url(url)
+        )
+        if invalid_custom_urls:
+            raise ConfigError(
+                f"Found {len(invalid_custom_urls)} invalid/placeholder custom RPC URL(s). "
+                "Fix or remove them instead of silently falling back to another endpoint."
+            )
+        custom_urls = raw_custom_urls
+
+        builtin_base_urls = (
+            "https://base.llamarpc.com",
+            "https://base-mainnet.public.blastapi.io",
+            "https://base.publicnode.com",
+        )
+        include_builtin_base = env_bool("INCLUDE_BUILTIN_BASE_PROVIDERS", False)
+        using_builtin_defaults = not custom_urls
+
+        raw_urls = (
+            (*custom_urls, *builtin_base_urls)
+            if custom_urls and include_builtin_base
+            else custom_urls
+            if custom_urls
+            else builtin_base_urls
+        )
+        urls = unique(raw_urls)
         if not urls:
             raise ConfigError(
                 "No usable RPC endpoints. Set PROVIDER_URLS='https://rpc1,https://rpc2'."
             )
 
         expected_chain_raw = env_text("EXPECTED_CHAIN_ID")
-        expected_chain_id = (
-            env_int("EXPECTED_CHAIN_ID", 1, minimum=1)
-            if expected_chain_raw
-            else None
-        )
+        if expected_chain_raw:
+            expected_chain_id = env_int("EXPECTED_CHAIN_ID", 1, minimum=1)
+        elif using_builtin_defaults or include_builtin_base:
+            # Built-in endpoints are Base mainnet. Enforce this automatically so
+            # a custom/misconfigured endpoint can never silently mix chains.
+            expected_chain_id = 8453
+        else:
+            expected_chain_id = None
 
         cfg = cls(
             provider_urls=urls,
@@ -294,6 +322,11 @@ class Config:
             log_backups=env_int("LOG_BACKUPS", 3, minimum=0),
         )
 
+        valid_log_levels = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}
+        if cfg.log_level not in valid_log_levels:
+            raise ConfigError(
+                f"LOG_LEVEL must be one of {sorted(valid_log_levels)}, got {cfg.log_level!r}"
+            )
         if cfg.block_tag not in {"latest", "pending", "safe", "finalized"}:
             raise ConfigError(
                 "BLOCK_TAG must be latest, pending, safe, or finalized"
@@ -369,6 +402,7 @@ class CircuitState(str, Enum):
     CLOSED = "closed"
     OPEN = "open"
     HALF_OPEN = "half-open"
+    DISABLED = "disabled"
 
 
 class RpcError(RuntimeError):
@@ -377,6 +411,10 @@ class RpcError(RuntimeError):
 
 class WrongChainError(RpcError):
     """RPC endpoint belongs to another chain."""
+
+
+class NoUsableProviderError(RpcError):
+    """No provider can become usable without a configuration change."""
 
 
 def redact_url(url: str) -> str:
@@ -418,7 +456,7 @@ def build_session(cfg: Config) -> requests.Session:
     session.headers.update(
         {
             "Accept": "application/json",
-            "User-Agent": f"{APP_NAME}/5",
+            "User-Agent": f"{APP_NAME}/6",
         }
     )
 
@@ -466,7 +504,7 @@ class Provider:
 
     def try_acquire(self, now: float, cfg: Config) -> bool:
         with self.lock:
-            if self.in_flight:
+            if self.in_flight or self.state is CircuitState.DISABLED:
                 return False
 
             if self.state is CircuitState.OPEN:
@@ -499,6 +537,12 @@ class Provider:
             self.last_error = f"{type(error).__name__}: {error}"
             self.in_flight = False
 
+            if isinstance(error, WrongChainError):
+                # A wrong-chain endpoint is configuration-invalid, not transient.
+                # Do not waste retries or allow it back through HALF_OPEN.
+                self.state = CircuitState.DISABLED
+                return
+
             if (
                 self.state is CircuitState.HALF_OPEN
                 or self.consecutive_failures >= cfg.failure_threshold
@@ -512,6 +556,7 @@ class Provider:
                 CircuitState.CLOSED: 0,
                 CircuitState.HALF_OPEN: 1,
                 CircuitState.OPEN: 2,
+                CircuitState.DISABLED: 3,
             }[self.state]
             return (
                 state_rank,
@@ -651,10 +696,9 @@ def fetch_quote(provider: Provider, cfg: Config) -> GasQuote:
         int(block_number_raw) if block_number_raw is not None else None
     )
 
-    latency_ms = round((time.perf_counter() - started) * 1000)
-
     if base_fee_raw is None:
         gas_price = int(w3.eth.gas_price)
+        latency_ms = round((time.perf_counter() - started) * 1000)
         return GasQuote(
             tx_type="legacy",
             chain_id=chain_id,
@@ -672,6 +716,7 @@ def fetch_quote(provider: Provider, cfg: Config) -> GasQuote:
 
     base_fee = int(base_fee_raw)
     priority_fee, priority_source = estimate_priority_fee(w3, cfg)
+    latency_ms = round((time.perf_counter() - started) * 1000)
 
     multiplier_scaled = int(
         (Decimal(base_fee) * cfg.max_fee_multiplier).to_integral_value(
@@ -734,12 +779,17 @@ class RpcPool:
             min(cfg.parallel_requests, len(self.providers)),
             cfg.expected_chain_id if cfg.expected_chain_id is not None else "any",
         )
+        if cfg.expected_chain_id is None and len(self.providers) > 1:
+            logger.warning(
+                "EXPECTED_CHAIN_ID is not set while multiple custom RPCs are configured; "
+                "set it to prevent accidental cross-chain mixing."
+            )
 
     def _run_provider(self, provider: Provider) -> GasQuote:
         started = time.perf_counter()
         try:
             quote = fetch_quote(provider, self.cfg)
-        except BaseException as exc:
+        except Exception as exc:
             provider.record_failure(exc, self.cfg)
             raise
         else:
@@ -761,6 +811,13 @@ class RpcPool:
     def fetch_once(self) -> GasQuote:
         candidates = self._candidates()
         if not candidates:
+            disabled = [p for p in self.providers if p.state is CircuitState.DISABLED]
+            if len(disabled) == len(self.providers):
+                detail = "; ".join(
+                    f"{p.safe_url}: {p.last_error or 'disabled'}" for p in disabled
+                )
+                raise NoUsableProviderError(f"All RPC providers are disabled: {detail}")
+
             next_retry = min(
                 (
                     max(
@@ -793,7 +850,7 @@ class RpcPool:
                 provider = futures[future]
                 try:
                     quote = future.result()
-                except BaseException as exc:
+                except Exception as exc:
                     errors.append(
                         f"{provider.safe_url}: {type(exc).__name__}: {exc}"
                     )
@@ -821,13 +878,15 @@ class RpcPool:
         detail = "; ".join(errors[-3:]) or "unknown error"
         raise RpcError(f"All selected RPC providers failed: {detail}")
 
-    def fetch_with_retries(self) -> GasQuote:
+    def fetch_with_retries(self, stop_event: Optional[threading.Event] = None) -> GasQuote:
         delay = self.cfg.retry_base_delay
         last_error: Optional[BaseException] = None
 
         for round_number in range(1, self.cfg.retry_rounds + 1):
             try:
                 return self.fetch_once()
+            except NoUsableProviderError:
+                raise
             except TRANSIENT_ERRORS + (RpcError,) as exc:
                 last_error = exc
                 if round_number >= self.cfg.retry_rounds:
@@ -845,7 +904,11 @@ class RpcPool:
                     delay,
                     exc,
                 )
-                time.sleep(delay)
+                if stop_event is not None:
+                    if stop_event.wait(delay):
+                        raise RpcError("Gas fetch interrupted by shutdown") from exc
+                else:
+                    time.sleep(delay)
 
         raise RpcError(
             f"Gas fetch failed after {self.cfg.retry_rounds} round(s): {last_error}"
@@ -931,7 +994,7 @@ def monitor(cfg: Config, logger: logging.Logger) -> None:
     try:
         while not shutdown.stopped:
             try:
-                emit(pool.fetch_with_retries(), cfg, logger)
+                emit(pool.fetch_with_retries(shutdown.event), cfg, logger)
             except Exception as exc:
                 logger.error("Gas fetch failed: %s", exc, exc_info=True)
 
