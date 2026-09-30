@@ -1,7 +1,6 @@
-```python
 #!/usr/bin/env python3
 """
-Ultra-Robust EVM Gas Price Monitor (v7)
+Ultra-Robust EVM Gas Price Monitor (v8)
 
 Production-oriented EVM gas monitor.
 
@@ -77,7 +76,7 @@ from web3.exceptions import ProviderConnectionError, TimeExhausted
 
 
 APP_NAME = "GasMonitor"
-APP_VERSION = "7"
+APP_VERSION = "8"
 GWEI = Decimal(1_000_000_000)
 
 
@@ -756,6 +755,7 @@ class Provider:
     last_success_at: float = 0.0
 
     last_error: str = ""
+    last_chain_id: Optional[int] = None
 
     lock: threading.Lock = field(
         default_factory=threading.Lock,
@@ -822,6 +822,7 @@ class Provider:
         self,
         latency: float,
         block_number: Optional[int],
+        chain_id: int,
         cfg: Config,
     ) -> None:
         with self.lock:
@@ -841,6 +842,7 @@ class Provider:
 
             self.last_error = ""
             self.last_success_at = time.monotonic()
+            self.last_chain_id = chain_id
 
             if block_number is not None:
                 self.last_block = block_number
@@ -914,6 +916,7 @@ class Provider:
                     1,
                 ),
                 "last_block": self.last_block,
+                "last_chain_id": self.last_chain_id,
                 "last_error": self.last_error,
             }
 
@@ -1073,8 +1076,6 @@ def estimate_priority_fee(
         cfg.max_priority_fee_gwei
     )
 
-    fee_history_error: Optional[BaseException] = None
-
     try:
         history = w3.eth.fee_history(
             cfg.fee_history_blocks,
@@ -1112,8 +1113,8 @@ def estimate_priority_fee(
                 "fee_history",
             )
 
-    except Exception as exc:
-        fee_history_error = exc
+    except Exception:
+        pass
 
     try:
         value = checked_nonnegative_int(
@@ -1392,6 +1393,7 @@ class RpcPool:
                 time.perf_counter()
                 - started,
                 quote.block_number,
+                quote.chain_id,
                 self.cfg,
             )
 
@@ -1435,106 +1437,134 @@ class RpcPool:
                 provider = futures[future]
                 provider.release_unstarted()
 
+    def _select_best_quote(
+        self,
+        successes: Sequence[GasQuote],
+    ) -> GasQuote:
+        if not successes:
+            raise ValueError("successes must not be empty")
+
+        numbered = [
+            quote for quote in successes
+            if quote.block_number is not None
+        ]
+
+        if numbered:
+            highest_block = max(
+                quote.block_number for quote in numbered
+                if quote.block_number is not None
+            )
+            minimum_block = max(
+                0,
+                highest_block - self.cfg.max_block_lag,
+            )
+            fresh = [
+                quote for quote in numbered
+                if quote.block_number is not None
+                and quote.block_number >= minimum_block
+            ]
+        else:
+            fresh = list(successes)
+
+        return min(
+            fresh,
+            key=lambda quote: (
+                quote.latency_ms,
+                -(quote.block_number or -1),
+                quote.provider,
+            ),
+        )
+
     def fetch_once(self) -> GasQuote:
         candidates = self._candidates()
 
         if not candidates:
+            snapshots = [p.snapshot() for p in self.providers]
             disabled = [
-                p
-                for p in self.providers
-                if p.state
-                is CircuitState.DISABLED
+                snap for snap in snapshots
+                if snap["state"] == CircuitState.DISABLED.value
             ]
 
-            if len(disabled) == len(
-                self.providers
-            ):
+            if len(disabled) == len(snapshots):
                 detail = "; ".join(
-                    f"{p.safe_url}: "
-                    f"{p.last_error or 'disabled'}"
-                    for p in disabled
+                    f"{snap['provider']}: "
+                    f"{snap['last_error'] or 'disabled'}"
+                    for snap in disabled
                 )
-
                 raise NoUsableProviderError(
-                    "All RPC providers are disabled: "
-                    + detail
+                    "All RPC providers are disabled: " + detail
                 )
 
             raise RpcError(
-                "No RPC provider is currently "
-                "available; waiting for circuit "
-                "breaker recovery."
+                "No RPC provider is currently available; "
+                "waiting for circuit breaker recovery."
             )
 
-        futures: dict[
-            Future[GasQuote],
-            Provider,
-        ] = {
-            self.executor.submit(
-                self._run_provider,
-                provider,
-            ): provider
+        futures: dict[Future[GasQuote], Provider] = {
+            self.executor.submit(self._run_provider, provider): provider
             for provider in candidates
         }
-
-        pending: set[
-            Future[GasQuote]
-        ] = set(futures)
-
+        pending: set[Future[GasQuote]] = set(futures)
         errors: list[str] = []
+        successes: list[GasQuote] = []
+        grace_deadline: Optional[float] = None
 
         while pending:
+            timeout: Optional[float] = None
+            if grace_deadline is not None:
+                timeout = max(0.0, grace_deadline - time.monotonic())
+
             done, pending = wait(
                 pending,
+                timeout=timeout,
                 return_when=FIRST_COMPLETED,
             )
 
+            if not done:
+                break
+
             for future in done:
                 provider = futures[future]
-
                 try:
                     quote = future.result()
-
                 except Exception as exc:
                     errors.append(
-                        f"{provider.safe_url}: "
-                        f"{type(exc).__name__}: "
-                        f"{exc}"
+                        f"{provider.safe_url}: {type(exc).__name__}: {exc}"
                     )
-
                     self.logger.debug(
-                        "RPC failed | provider=%s | "
-                        "error=%s",
+                        "RPC failed | provider=%s | error=%s",
                         provider.safe_url,
                         exc,
                     )
-
                     continue
 
-                self._cancel_pending(
-                    pending,
-                    futures,
-                )
+                successes.append(quote)
+                if grace_deadline is None:
+                    grace_seconds = self.cfg.first_result_grace_ms / 1000.0
+                    if grace_seconds <= 0.0:
+                        self._cancel_pending(pending, futures)
+                        return quote
+                    grace_deadline = time.monotonic() + grace_seconds
 
-                self.logger.debug(
-                    "RPC selected | provider=%s | "
-                    "latency=%dms | block=%s",
-                    quote.provider,
-                    quote.latency_ms,
-                    quote.block_number,
-                )
+            if successes and not pending:
+                break
 
-                return quote
+        if successes:
+            selected = self._select_best_quote(successes)
+            self._cancel_pending(pending, futures)
+            self.logger.debug(
+                "RPC selected | provider=%s | latency=%dms | block=%s | "
+                "candidates=%d",
+                selected.provider,
+                selected.latency_ms,
+                selected.block_number,
+                len(successes),
+            )
+            return selected
 
-        detail = (
-            "; ".join(errors[-3:])
-            or "unknown error"
-        )
-
-        raise RpcError(
-            "All selected RPC providers failed: "
-            + detail
-        )
+        self._cancel_pending(pending, futures)
+        detail = "; ".join(errors[-3:]) or "unknown error"
+        raise RpcError("All selected RPC providers failed: " + detail)
 
     def fetch_with_retries(
         self,
@@ -1656,6 +1686,7 @@ class GracefulShutdown:
     ) -> None:
         self.event = threading.Event()
         self.logger = logger
+        self.signal_number: Optional[int] = None
 
         for sig in (
             signal.SIGINT,
@@ -1684,11 +1715,12 @@ class GracefulShutdown:
         signum: int,
         _frame: Any,
     ) -> None:
-        self.logger.info(
-            "Shutdown signal received: %s",
-            signum,
-        )
-
+        if not self.event.is_set():
+            self.signal_number = signum
+            self.logger.info(
+                "Shutdown signal received: %s",
+                signum,
+            )
         self.event.set()
 
     @property
@@ -1758,7 +1790,7 @@ def emit(
 def monitor(
     cfg: Config,
     logger: logging.Logger,
-) -> None:
+) -> int:
     shutdown = GracefulShutdown(logger)
     pool = RpcPool(
         cfg,
@@ -1832,6 +1864,12 @@ def monitor(
             "Gas monitor stopped"
         )
 
+    if shutdown.signal_number == getattr(signal, "SIGINT", None):
+        return 130
+    if shutdown.signal_number == getattr(signal, "SIGTERM", None):
+        return 143
+    return 0
+
 
 # ============================================================
 # MAIN
@@ -1852,12 +1890,10 @@ def main() -> int:
     logger = setup_logger(cfg)
 
     try:
-        monitor(
+        return monitor(
             cfg,
             logger,
         )
-
-        return 0
 
     except KeyboardInterrupt:
         return 130
@@ -1873,4 +1909,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-```
