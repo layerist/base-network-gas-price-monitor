@@ -20,7 +20,7 @@ Key properties:
 - Configurable max-fee multiplier and absolute cap.
 - Strict numeric validation of RPC responses.
 - JSON output is stdout-only; logs go to stderr/file.
-- Secrets/API keys are redacted from logs.
+- RPC URL credentials, query parameters and paths are redacted from logs.
 - Graceful shutdown.
 - Deterministic resource cleanup.
 - Provider health statistics.
@@ -47,6 +47,7 @@ import logging
 import math
 import os
 import random
+import re
 import signal
 import statistics
 import sys
@@ -64,7 +65,7 @@ from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from enum import Enum
 from logging.handlers import RotatingFileHandler
 from typing import Any, Iterable, Mapping, Optional, Sequence
-from urllib.parse import SplitResult, urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -214,7 +215,7 @@ def unique(items: Iterable[str]) -> tuple[str, ...]:
 
 
 def usable_http_url(value: str) -> bool:
-    if not value:
+    if not value or any(char.isspace() for char in value):
         return False
 
     lowered = value.lower()
@@ -233,12 +234,15 @@ def usable_http_url(value: str) -> bool:
 
     try:
         parsed = urlsplit(value)
+        # Accessing .port validates an otherwise silently accepted bad port.
+        parsed.port
     except ValueError:
         return False
 
     return (
-        parsed.scheme in {"http", "https"}
+        parsed.scheme.lower() in {"http", "https"}
         and bool(parsed.hostname)
+        and not parsed.fragment
     )
 
 
@@ -544,7 +548,39 @@ class Config:
 # ============================================================
 
 
-class JsonFormatter(logging.Formatter):
+_URL_IN_MESSAGE = re.compile(
+    r"(?:https?|socks[45]h?)://[^\s\"'<>]+",
+    flags=re.IGNORECASE,
+)
+
+
+def redact_url(url: str) -> str:
+    """Never expose URL credentials, path components or query API keys."""
+    try:
+        parsed = urlsplit(url)
+        host = parsed.hostname
+        if not host:
+            return "<redacted-url>"
+        if ":" in host:  # IPv6 literal
+            host = f"[{host}]"
+        if parsed.port is not None:
+            host = f"{host}:{parsed.port}"
+        return f"{parsed.scheme}://{host}"
+    except ValueError:
+        return "<redacted-url>"
+
+
+def redact_message(message: str) -> str:
+    """Scrub endpoint URLs, including any carried by request exceptions."""
+    return _URL_IN_MESSAGE.sub(lambda match: redact_url(match.group()), message)
+
+
+class RedactingFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_message(super().format(record))
+
+
+class JsonFormatter(RedactingFormatter):
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
             "timestamp": self.formatTime(
@@ -561,11 +597,11 @@ class JsonFormatter(logging.Formatter):
                 record.exc_info
             )
 
-        return json.dumps(
+        return redact_message(json.dumps(
             payload,
             ensure_ascii=False,
             separators=(",", ":"),
-        )
+        ))
 
 
 def setup_logger(cfg: Config) -> logging.Logger:
@@ -588,7 +624,7 @@ def setup_logger(cfg: Config) -> logging.Logger:
     if cfg.log_json:
         formatter = JsonFormatter()
     else:
-        formatter = logging.Formatter(
+        formatter = RedactingFormatter(
             "%(asctime)s | %(levelname)-8s | %(message)s"
         )
 
@@ -597,14 +633,18 @@ def setup_logger(cfg: Config) -> logging.Logger:
     logger.addHandler(console)
 
     if cfg.log_file:
-        file_handler = RotatingFileHandler(
-            cfg.log_file,
-            maxBytes=cfg.log_max_bytes,
-            backupCount=cfg.log_backups,
-            encoding="utf-8",
-        )
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
+        try:
+            file_handler = RotatingFileHandler(
+                cfg.log_file,
+                maxBytes=cfg.log_max_bytes,
+                backupCount=cfg.log_backups,
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.warning("File logging unavailable: %s", exc)
+        else:
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
 
     return logger
 
@@ -637,51 +677,12 @@ class InvalidRpcValueError(RpcError):
     pass
 
 
+class FeeCapExceededError(RpcError):
+    """A valid network quote is incompatible with the configured fee cap."""
+
+
 class NoUsableProviderError(RpcError):
     pass
-
-
-def redact_url(url: str) -> str:
-    try:
-        parsed = urlsplit(url)
-
-        host = parsed.hostname or "unknown"
-
-        if parsed.port:
-            host = f"{host}:{parsed.port}"
-
-        parts = [
-            part
-            for part in parsed.path.split("/")
-            if part
-        ]
-
-        safe_parts: list[str] = []
-
-        for part in parts:
-            if len(part) > 12:
-                safe_parts.append("***")
-            else:
-                safe_parts.append(part)
-
-        safe_path = (
-            "/" + "/".join(safe_parts)
-            if safe_parts
-            else ""
-        )
-
-        safe = SplitResult(
-            parsed.scheme,
-            host,
-            safe_path,
-            "",
-            "",
-        )
-
-        return urlunsplit(safe)
-
-    except Exception:
-        return "<redacted-rpc>"
 
 
 def build_session(cfg: Config) -> requests.Session:
@@ -769,24 +770,26 @@ class Provider:
         cfg: Config,
     ) -> "Provider":
         session = build_session(cfg)
-
-        provider = Web3.HTTPProvider(
-            url,
-            request_kwargs={
-                "timeout": (
-                    cfg.http_timeout,
-                    cfg.http_timeout,
-                ),
-            },
-            session=session,
-        )
-
-        return cls(
-            url=url,
-            safe_url=redact_url(url),
-            session=session,
-            w3=Web3(provider),
-        )
+        try:
+            provider = Web3.HTTPProvider(
+                url,
+                request_kwargs={
+                    "timeout": (
+                        cfg.http_timeout,
+                        cfg.http_timeout,
+                    ),
+                },
+                session=session,
+            )
+            return cls(
+                url=url,
+                safe_url=redact_url(url),
+                session=session,
+                w3=Web3(provider),
+            )
+        except Exception:
+            session.close()
+            raise
 
     def try_acquire(
         self,
@@ -856,7 +859,7 @@ class Provider:
             self.consecutive_failures += 1
             self.total_failures += 1
 
-            self.last_error = (
+            self.last_error = redact_message(
                 f"{type(error).__name__}: {error}"
             )
 
@@ -878,6 +881,17 @@ class Provider:
             ):
                 self.state = CircuitState.OPEN
                 self.opened_at = time.monotonic()
+
+    def record_quote_rejection(self, error: FeeCapExceededError) -> None:
+        # The provider returned valid data. An application fee limit must
+        # never trip its circuit breaker or count as an RPC failure.
+        with self.lock:
+            self.in_flight = False
+            self.state = CircuitState.CLOSED
+            self.consecutive_failures = 0
+            self.last_error = redact_message(
+                f"{type(error).__name__}: {error}"
+            )
 
     def release_unstarted(self) -> None:
         with self.lock:
@@ -978,12 +992,25 @@ def checked_nonnegative_int(
     value: Any,
     name: str,
 ) -> int:
-    try:
-        result = int(value)
-    except (TypeError, ValueError) as exc:
+    # int(float) silently truncates; int(True) silently accepts booleans.
+    # RPC quantities may be Web3-decoded integers or hex-quantity strings.
+    if isinstance(value, bool):
         raise InvalidRpcValueError(
             f"{name} is not an integer: {value!r}"
-        ) from exc
+        )
+    if isinstance(value, int):
+        result = value
+    elif isinstance(value, str) and re.fullmatch(
+        r"(?:0[xX][0-9a-fA-F]+|[0-9]+)", value
+    ):
+        try:
+            result = int(value, 16 if value.lower().startswith("0x") else 10)
+        except ValueError as exc:
+            raise InvalidRpcValueError(f"{name} exceeds integer limits") from exc
+    else:
+        raise InvalidRpcValueError(
+            f"{name} is not an integer: {value!r}"
+        )
 
     if result < 0:
         raise InvalidRpcValueError(
@@ -1258,7 +1285,7 @@ def fetch_quote(
 
     if cap > 0:
         if cap < minimum_viable_max_fee:
-            raise InvalidRpcValueError(
+            raise FeeCapExceededError(
                 "MAX_FEE_CAP_GWEI is below "
                 "base_fee + priority_fee"
             )
@@ -1326,13 +1353,14 @@ class RpcPool:
         urls = list(cfg.provider_urls)
         random.shuffle(urls)
 
-        self.providers = [
-            Provider.create(
-                url,
-                cfg,
-            )
-            for url in urls
-        ]
+        self.providers: list[Provider] = []
+        try:
+            for url in urls:
+                self.providers.append(Provider.create(url, cfg))
+        except Exception:
+            for provider in self.providers:
+                provider.close()
+            raise
 
         worker_count = min(
             len(self.providers),
@@ -1342,10 +1370,15 @@ class RpcPool:
             ),
         )
 
-        self.executor = ThreadPoolExecutor(
-            max_workers=worker_count,
-            thread_name_prefix="rpc",
-        )
+        try:
+            self.executor = ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="rpc",
+            )
+        except Exception:
+            for provider in self.providers:
+                provider.close()
+            raise
 
         logger.info(
             "Loaded %d RPC provider(s) | "
@@ -1380,6 +1413,10 @@ class RpcPool:
                 provider,
                 self.cfg,
             )
+
+        except FeeCapExceededError as exc:
+            provider.record_quote_rejection(exc)
+            raise
 
         except Exception as exc:
             provider.record_failure(
@@ -1470,7 +1507,7 @@ class RpcPool:
             fresh,
             key=lambda quote: (
                 quote.latency_ms,
-                -(quote.block_number or -1),
+                -(quote.block_number if quote.block_number is not None else -1),
                 quote.provider,
             ),
         )
@@ -1500,71 +1537,91 @@ class RpcPool:
                 "waiting for circuit breaker recovery."
             )
 
-        futures: dict[Future[GasQuote], Provider] = {
-            self.executor.submit(self._run_provider, provider): provider
-            for provider in candidates
-        }
+        futures: dict[Future[GasQuote], Provider] = {}
+        # An executor failure must not strand a provider in in_flight state.
+        try:
+            for provider in candidates:
+                try:
+                    future = self.executor.submit(self._run_provider, provider)
+                except Exception:
+                    provider.release_unstarted()
+                    raise
+                futures[future] = provider
+        except Exception:
+            submitted_providers = {id(provider) for provider in futures.values()}
+            for provider in candidates:
+                if id(provider) not in submitted_providers:
+                    provider.release_unstarted()
+            self._cancel_pending(set(futures), futures)
+            raise
+
         pending: set[Future[GasQuote]] = set(futures)
         errors: list[str] = []
         successes: list[GasQuote] = []
         grace_deadline: Optional[float] = None
 
-        while pending:
-            timeout: Optional[float] = None
-            if grace_deadline is not None:
-                timeout = max(0.0, grace_deadline - time.monotonic())
+        try:
+            while pending:
+                timeout: Optional[float] = None
+                if grace_deadline is not None:
+                    timeout = max(0.0, grace_deadline - time.monotonic())
 
-            done, pending = wait(
-                pending,
-                timeout=timeout,
-                return_when=FIRST_COMPLETED,
-            )
+                done, pending = wait(
+                    pending,
+                    timeout=timeout,
+                    return_when=FIRST_COMPLETED,
+                )
 
-            if not done:
-                break
+                if not done:
+                    break
 
-            for future in done:
-                provider = futures[future]
-                try:
-                    quote = future.result()
-                except Exception as exc:
-                    errors.append(
-                        f"{provider.safe_url}: {type(exc).__name__}: {exc}"
-                    )
-                    self.logger.debug(
-                        "RPC failed | provider=%s | error=%s",
-                        provider.safe_url,
-                        exc,
-                    )
-                    continue
+                for future in done:
+                    provider = futures[future]
+                    try:
+                        quote = future.result()
+                    except Exception as exc:
+                        safe_error = redact_message(
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        errors.append(f"{provider.safe_url}: {safe_error}")
+                        self.logger.debug(
+                            "RPC failed | provider=%s | error=%s",
+                            provider.safe_url,
+                            safe_error,
+                        )
+                        continue
 
-                successes.append(quote)
-                if grace_deadline is None:
-                    grace_seconds = self.cfg.first_result_grace_ms / 1000.0
-                    if grace_seconds <= 0.0:
-                        self._cancel_pending(pending, futures)
-                        return quote
-                    grace_deadline = time.monotonic() + grace_seconds
+                    successes.append(quote)
+                    if grace_deadline is None:
+                        grace_seconds = self.cfg.first_result_grace_ms / 1000.0
+                        grace_deadline = time.monotonic() + grace_seconds
 
-            if successes and not pending:
-                break
+                # Process every future in the completed batch, even with zero
+                # grace; a set's iteration order does not indicate speed.
+                if successes and (
+                    self.cfg.first_result_grace_ms == 0
+                    or not pending
+                ):
+                    break
 
-        if successes:
-            selected = self._select_best_quote(successes)
+            if successes:
+                selected = self._select_best_quote(successes)
+                self.logger.debug(
+                    "RPC selected | provider=%s | latency=%dms | block=%s | "
+                    "candidates=%d",
+                    selected.provider,
+                    selected.latency_ms,
+                    selected.block_number,
+                    len(successes),
+                )
+                return selected
+
+            detail = "; ".join(errors[-3:]) or "unknown error"
+            raise RpcError("All selected RPC providers failed: " + detail)
+        finally:
+            # Running work finishes asynchronously and releases itself.
+            # Only canceled-before-start work may be released here.
             self._cancel_pending(pending, futures)
-            self.logger.debug(
-                "RPC selected | provider=%s | latency=%dms | block=%s | "
-                "candidates=%d",
-                selected.provider,
-                selected.latency_ms,
-                selected.block_number,
-                len(successes),
-            )
-            return selected
-
-        self._cancel_pending(pending, futures)
-        detail = "; ".join(errors[-3:]) or "unknown error"
-        raise RpcError("All selected RPC providers failed: " + detail)
 
     def fetch_with_retries(
         self,
@@ -1581,6 +1638,8 @@ class RpcPool:
             1,
             self.cfg.retry_rounds + 1,
         ):
+            if stop_event is not None and stop_event.is_set():
+                raise RpcError("Gas fetch interrupted by shutdown")
             try:
                 return self.fetch_once()
 
@@ -1593,14 +1652,7 @@ class RpcPool:
                 # Never waste retry rounds on it.
                 raise
 
-            except (
-                TRANSIENT_ERRORS
-                + (
-                    RpcError,
-                    StaleBlockError,
-                    InvalidRpcValueError,
-                )
-            ) as exc:
+            except TRANSIENT_ERRORS + (RpcError,) as exc:
                 last_error = exc
 
                 if (
@@ -1685,8 +1737,8 @@ class GracefulShutdown:
         logger: logging.Logger,
     ) -> None:
         self.event = threading.Event()
-        self.logger = logger
         self.signal_number: Optional[int] = None
+        self._previous_handlers: dict[int, Any] = {}
 
         for sig in (
             signal.SIGINT,
@@ -1700,10 +1752,12 @@ class GracefulShutdown:
                 continue
 
             try:
+                old_handler = signal.getsignal(sig)
                 signal.signal(
                     sig,
                     self._handle,
                 )
+                self._previous_handlers[sig] = old_handler
             except (
                 ValueError,
                 OSError,
@@ -1717,11 +1771,12 @@ class GracefulShutdown:
     ) -> None:
         if not self.event.is_set():
             self.signal_number = signum
-            self.logger.info(
-                "Shutdown signal received: %s",
-                signum,
-            )
         self.event.set()
+
+    def close(self) -> None:
+        for sig, handler in self._previous_handlers.items():
+            signal.signal(sig, handler)
+        self._previous_handlers.clear()
 
     @property
     def stopped(self) -> bool:
@@ -1792,28 +1847,26 @@ def monitor(
     logger: logging.Logger,
 ) -> int:
     shutdown = GracefulShutdown(logger)
-    pool = RpcPool(
-        cfg,
-        logger,
-    )
-
-    logger.info(
-        "Gas monitor started | "
-        "version=%s | interval=%.2fs | "
-        "block_tag=%s",
-        APP_VERSION,
-        cfg.monitor_interval,
-        cfg.block_tag,
-    )
-
-    next_run = time.monotonic()
-
+    pool: Optional[RpcPool] = None
     try:
+        pool = RpcPool(cfg, logger)
+        logger.info(
+            "Gas monitor started | "
+            "version=%s | interval=%.2fs | "
+            "block_tag=%s",
+            APP_VERSION,
+            cfg.monitor_interval,
+            cfg.block_tag,
+        )
+
+        next_run = time.monotonic()
         while not shutdown.stopped:
             try:
                 quote = pool.fetch_with_retries(
                     shutdown.event,
                 )
+                if shutdown.stopped:
+                    break
 
                 emit(
                     quote,
@@ -1824,11 +1877,12 @@ def monitor(
                 pool.log_health()
 
             except Exception as exc:
-                logger.error(
-                    "Gas fetch failed: %s",
-                    exc,
-                    exc_info=True,
-                )
+                if not shutdown.stopped:
+                    logger.error(
+                        "Gas fetch failed: %s",
+                        exc,
+                        exc_info=True,
+                    )
 
             next_run += (
                 cfg.monitor_interval
@@ -1859,7 +1913,13 @@ def monitor(
             )
 
     finally:
-        pool.close()
+        try:
+            if pool is not None:
+                pool.close()
+        finally:
+            shutdown.close()
+        if shutdown.signal_number is not None:
+            logger.info("Shutdown signal received: %s", shutdown.signal_number)
         logger.info(
             "Gas monitor stopped"
         )
